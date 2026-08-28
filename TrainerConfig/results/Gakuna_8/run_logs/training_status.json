@@ -1,0 +1,29 @@
+{
+    "Evacuationer": {
+        "checkpoints": [
+            {
+                "steps": 2300,
+                "file_path": "results\\Gakuna_8\\Evacuationer\\Evacuationer-2300.onnx",
+                "reward": -2068.5301115616508,
+                "creation_time": 1777653738.8746827,
+                "auxillary_file_paths": [
+                    "results\\Gakuna_8\\Evacuationer\\Evacuationer-2300.pt"
+                ]
+            }
+        ],
+        "final_checkpoint": {
+            "steps": 2300,
+            "file_path": "results\\Gakuna_8\\Evacuationer.onnx",
+            "reward": -2068.5301115616508,
+            "creation_time": 1777653738.8746827,
+            "auxillary_file_paths": [
+                "results\\Gakuna_8\\Evacuationer\\Evacuationer-2300.pt"
+            ]
+        }
+    },
+    "metadata": {
+        "stats_format_version": "0.3.0",
+        "mlagents_version": "1.1.0",
+        "torch_version": "2.6.0+cu124"
+    }
+}

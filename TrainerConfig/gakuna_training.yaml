@@ -1,0 +1,35 @@
+behaviors:
+  Evacuationer:
+    summary_freq: 500
+    trainer_type: ppo  # The algorithm we're using
+    
+    hyperparameters:
+      # How fast the AI learns (too high = unstable, too low = slow)
+      learning_rate: 0.0003
+      
+      # How many experiences to learn from at once
+      batch_size: 1024
+      
+      # How many experiences to collect before training
+      buffer_size: 10240
+      
+    # Neural network structure
+    network_settings:
+      # Normalize inputs (converts all numbers to 0-1 range)
+      normalize: true
+      
+      # How many "brain cells" in each layer
+      hidden_units: 256
+      
+      # How many layers of "brain cells"
+      num_layers: 3
+      
+    # Reward settings
+    reward_signals:
+      extrinsic:
+        # How much to value future rewards (0.99 = value long-term safety)
+        gamma: 0.99
+        strength: 1.0
+
+    # How many training steps (more = better learning, but takes longer)
+    max_steps: 5000000  # 5 million steps = ~6-8 hours
