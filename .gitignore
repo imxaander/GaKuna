@@ -1,0 +1,39 @@
+# ─── Unity ─────────────────────────────────────
+Unity/Library/
+Unity/Temp/
+Unity/Logs/
+Unity/UserSettings/
+Unity/Obj/
+Unity/Build/
+Unity/Builds/
+Unity/Assets/AssetStoreTools*
+*.csproj
+*.sln
+*.user
+
+# ─── Python ────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+*.env
+
+# ─── Arduino ────────────────────────────────────
+build/
+*.ino.bin
+*.ino.hex
+
+# ─── ML-Agents training ────────────────────────
+TrainerConfig/results/*/Evacuationer/events.out.tfevents.*
+TrainerConfig/results/*/Evacuationer/checkpoint.pt
+TrainerConfig/results/*/run_logs/*.json
+
+# ─── OS / editor ───────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
