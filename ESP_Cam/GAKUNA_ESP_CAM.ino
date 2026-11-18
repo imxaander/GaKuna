@@ -24,7 +24,7 @@
 // ─── NETWORK CONFIG ───────────────────────────
 const char* SSID          = "gakunapi_wifi";
 const char* PASSWORD      = "gakunapass";
-const char* STREAM_HOST   = "192.168.4.1";
+const char* STREAM_HOST   = "192.168.1.13";
 const uint16_t STREAM_PORT = 8081;
 
 // ─── WEB SERVER ───────────────────────────────

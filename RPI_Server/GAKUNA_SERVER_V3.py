@@ -4,7 +4,7 @@ GaKuna Server
 Hosts a web dashboard AND manages TCP connections to ESP32 nodes.
 Integrates OpenCV-based blockage detection from ESP32-CAM.
 Run with: python3 server.py
-Access dashboard at: http://192.168.4.1:8080
+Access dashboard at: http://<pi-ip>:8080
 """
 
 import socket
@@ -32,8 +32,8 @@ NODE_CONFIG = [
     {"id": "node_2", "name": "Node 12 - Floor 1 Left",   "ip": "DHCP", "port": 5001},
 ]
 
-PI_HOST           = '0.0.0.0' #windows
-# PI_HOST           = '10.42.0.1' #pi
+# Listen on all interfaces; ESP32s connect to the Pi's router-assigned address.
+PI_HOST = '0.0.0.0'
 ESP32_SERVER_PORT = 5001
 CAMERA_STREAM_PORT = 8081
 VALID_COMMANDS    = ["LEFT", "RIGHT", "STOP", "OFF"]

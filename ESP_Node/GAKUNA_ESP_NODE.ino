@@ -4,7 +4,6 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <ArduinoJson.h>
-#include <SoftwareSerial.h>
 #include <DFRobotDFPlayerMini.h>
 
 // ─── PIN CONFIG (GaKuna node ESP32) ───────────
@@ -33,7 +32,7 @@ const uint8_t MLX_ADDR = 0x33; // MLX90640 default I2C address
 // ─── NETWORK CONFIG ───────────────────────────
 const char* SSID        = "gakunapi_wifi";
 const char* PASSWORD    = "gakunapass";
-const char* PI_IP       = "192.168.4.1";
+const char* PI_IP       = "192.168.1.13";
 const int   PI_PORT     = 5001;   // Must match ESP32_SERVER_PORT in server.py
 const char* NODE_ID     = "node_1"; // Must match an ID in the server's NODE_CONFIG
 
@@ -42,7 +41,6 @@ DHT dht(DHT_PIN, DHT_TYPE);
 Adafruit_MLX90640 mlx;
 float mlxFrame[32 * 24];          // 32x24 thermal frame (°C)
 bool  mlxReady = false;
-SoftwareSerial dfSerial(DF_RX_PIN, DF_TX_PIN);
 DFRobotDFPlayerMini dfPlayer;
 WiFiClient client;
 
@@ -136,9 +134,9 @@ void setup() {
     pinMode(CROSS_LED, OUTPUT);
 
     // DFPlayer
-    dfSerial.begin(9600);
+    Serial2.begin(9600, SERIAL_8N1, DF_RX_PIN, DF_TX_PIN);
     Serial.println("Initializing DFPlayer...");
-    if (!dfPlayer.begin(dfSerial)) {
+    if (!dfPlayer.begin(Serial2)) {
         Serial.println("DFPlayer not found — check wiring and SD card!");
     } else {
         Serial.println("DFPlayer ready.");
