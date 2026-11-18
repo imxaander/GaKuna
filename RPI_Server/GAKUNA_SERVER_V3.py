@@ -22,7 +22,12 @@ from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'gakuna2025'
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode='threading',
+    manage_session=False,
+)
 
 # ─────────────────────────────────────────────
 # NODE CONFIGURATION
