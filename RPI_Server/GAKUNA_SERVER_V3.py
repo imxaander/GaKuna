@@ -85,6 +85,7 @@ class CameraState:
         self.id       = config["id"]
         self.name     = config["name"]
         self.url      = config["url"]
+        self.ip       = None
         self.node_id  = config["node_id"]
         self.enabled  = config["enabled"]
         self.blocked  = False
@@ -102,6 +103,7 @@ class CameraState:
             "id":             self.id,
             "name":           self.name,
             "url":            self.url,
+            "ip":             self.ip,
             "node_id":        self.node_id,
             "enabled":        self.enabled,
             "blocked":        self.blocked,
@@ -112,6 +114,11 @@ class CameraState:
         }
 
 cameras = {cfg["id"]: CameraState(cfg) for cfg in CAMERA_CONFIG}
+
+def camera_matches_ip(cam, ip):
+    with cam.lock:
+        camera_ip = cam.ip
+    return camera_ip == ip or (cam.url and cam.url.startswith(f"http://{ip}"))
 
 # ─────────────────────────────────────────────
 # NODE STATE MANAGER
@@ -225,6 +232,9 @@ def start_camera_stream_server():
         conn, addr = server.accept()
         print(f"[CAM] Stream connected from {addr[0]}:{addr[1]}")
         target = cameras.get("cam_1")
+        if target:
+            with target.lock:
+                target.ip = addr[0]
         try:
             while True:
                 header = read_exact(conn, 4)
@@ -450,7 +460,7 @@ def get_connected_devices():
                                     device_type = 'esp32'
                                     break
                             for cam in cameras.values():
-                                if cam.url and cam.url.startswith(f"http://{ip}"):
+                                if camera_matches_ip(cam, ip):
                                     node_name   = cam.name
                                     device_type = 'camera'
                                     break
@@ -491,7 +501,7 @@ def get_connected_devices():
                         device_type = 'esp32'
                         break
                 for cam in cameras.values():
-                    if cam.url and cam.url.startswith(f"http://{ip}"):
+                    if camera_matches_ip(cam, ip):
                         node_name   = cam.name
                         device_type = 'camera'
                         break
