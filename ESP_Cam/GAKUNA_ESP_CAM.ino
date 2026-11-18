@@ -22,11 +22,38 @@
 #define PCLK_GPIO_NUM     22
 
 // ─── NETWORK CONFIG ───────────────────────────
-const char* SSID     = "gakunapi_wifi";
-const char* PASSWORD = "gakunapass";
+const char* SSID          = "gakunapi_wifi";
+const char* PASSWORD      = "gakunapass";
+const char* STREAM_HOST   = "192.168.4.1";
+const uint16_t STREAM_PORT = 8081;
 
 // ─── WEB SERVER ───────────────────────────────
 WebServer server(80);
+WiFiClient streamClient;
+
+void ensureStreamConnection() {
+    if (streamClient.connected()) return;
+    streamClient.stop();
+    Serial.printf("[CAM] Connecting to frame stream %s:%u\n",
+                  STREAM_HOST, STREAM_PORT);
+    streamClient.connect(STREAM_HOST, STREAM_PORT);
+}
+
+void sendStreamFrame(camera_fb_t* fb) {
+    if (!fb) return;
+    ensureStreamConnection();
+    if (!streamClient.connected()) return;
+
+    uint32_t length = fb->len;
+    uint8_t header[4] = {
+        (uint8_t)(length & 0xff),
+        (uint8_t)((length >> 8) & 0xff),
+        (uint8_t)((length >> 16) & 0xff),
+        (uint8_t)((length >> 24) & 0xff)
+    };
+    streamClient.write(header, sizeof(header));
+    streamClient.write(fb->buf, fb->len);
+}
 
 // ─── CAMERA INIT ──────────────────────────────
 void initCamera() {
@@ -53,7 +80,18 @@ void initCamera() {
     config.pixel_format = PIXFORMAT_JPEG;
     config.frame_size   = FRAMESIZE_QVGA;  // 320x240
     config.jpeg_quality = 15;
-    config.fb_count     = 1;
+
+    // Frame buffering — 2 PSRAM buffers avoid cam_hal: FB-OVF while serving
+    if (psramFound()) {
+        config.fb_count    = 2;
+        config.fb_location = CAMERA_FB_IN_PSRAM;
+        config.grab_mode   = CAMERA_GRAB_LATEST;
+    } else {
+        Serial.println("[CAM] WARNING: PSRAM not found — enable it in Tools menu");
+        config.fb_count    = 1;
+        config.fb_location = CAMERA_FB_IN_DRAM;
+        config.grab_mode   = CAMERA_GRAB_WHEN_EMPTY;
+    }
 
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
@@ -133,4 +171,14 @@ void loop() {
     }
 
     server.handleClient();
+
+    ensureStreamConnection();
+    if (streamClient.connected()) {
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (fb) {
+            sendStreamFrame(fb);
+            esp_camera_fb_return(fb);
+        }
+    }
+    delay(50);
 }

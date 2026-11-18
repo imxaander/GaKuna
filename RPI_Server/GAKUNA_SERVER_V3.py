@@ -10,6 +10,7 @@ Access dashboard at: http://192.168.4.1:8080
 import socket
 import threading
 import json
+import struct
 import time
 import subprocess
 import re
@@ -27,13 +28,14 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 # NODE CONFIGURATION
 # ─────────────────────────────────────────────
 NODE_CONFIG = [
-    {"id": "node_1", "name": "Node 11 - Floor 1 Left",   "ip": "10.42.0.1", "port": 5001},
-    {"id": "node_2", "name": "Node 12 - Floor 1 Left",   "ip": "10.42.0.125", "port": 5001},
+    {"id": "node_1", "name": "Node 11 - Floor 1 Left",   "ip": "DHCP", "port": 5001},
+    {"id": "node_2", "name": "Node 12 - Floor 1 Left",   "ip": "DHCP", "port": 5001},
 ]
 
 PI_HOST           = '0.0.0.0' #windows
 # PI_HOST           = '10.42.0.1' #pi
 ESP32_SERVER_PORT = 5001
+CAMERA_STREAM_PORT = 8081
 VALID_COMMANDS    = ["LEFT", "RIGHT", "STOP", "OFF"]
 
 # ─────────────────────────────────────────────
@@ -44,25 +46,10 @@ CAMERA_CONFIG = [
     {
         "id":         "cam_1",
         "name":       "Camera - Node 11",
-        "url":        "http://192.168.1.21/capture",  # ESP32-CAM IP
-        "node_id":    "node_1",                         # Which node this camera monitors
+        "url":        None,  # Uses the ESP32-CAM TCP stream on CAMERA_STREAM_PORT
+        "node_id":    "node_1",
         "enabled":    True,
     },
-        {
-        "id":         "cam_2",
-        "name":       "Camera - Node 12",
-        "url":        "http://192.168.1.21/capture",  # ESP32-CAM IP
-        "node_id":    "node_2",                         # Which node this camera monitors
-        "enabled":    True,
-    },
-    # Add more cameras here as needed
-    # {
-    #     "id":      "cam_2",
-    #     "name":    "Camera - Node 21",
-    #     "url":     "http://192.168.4.202/capture",
-    #     "node_id": "node_3",
-    #     "enabled": True,
-    # },
 ]
 
 # ─────────────────────────────────────────────
@@ -101,6 +88,8 @@ class CameraState:
         self.last_seen      = None
         self.error          = None
         self.latest_frame   = None   # JPEG bytes for live view
+        self.tcp_frame      = None   # Raw JPEG received from ESP32-CAM
+        self.tcp_seen       = 0.0
         self.lock           = threading.Lock()
 
     def to_dict(self):
@@ -131,6 +120,11 @@ class NodeState:
         self.temperature      = None
         self.seismic          = None
         self.blocked          = False
+        self.thermal          = None    # MLX90640 hotspot (°C)
+        self.thermal_min      = None
+        self.thermal_max      = None
+        self.thermal_img      = None    # rendered thermal JPeg bytes
+        self.thermal_last     = None
         self.current_sign     = "OFF"
         self.override         = False
         self.override_command = "OFF"
@@ -147,6 +141,11 @@ class NodeState:
             "temperature":      self.temperature,
             "seismic":          self.seismic,
             "blocked":          self.blocked,
+            "thermal":          self.thermal,
+            "thermal_min":      self.thermal_min,
+            "thermal_max":      self.thermal_max,
+            "thermal_last":     self.thermal_last,
+            "has_thermal":      self.thermal_img is not None,
             "current_sign":     self.current_sign,
             "override":         self.override,
             "override_command": self.override_command,
@@ -189,6 +188,59 @@ def fetch_frame(url, timeout=3):
         return frame
     except Exception as e:
         return None
+
+def fetch_tcp_frame(cam):
+    """Decode the newest JPEG received through the ESP32-CAM TCP stream."""
+    with cam.lock:
+        data = cam.tcp_frame
+        seen = cam.tcp_seen
+    if data is None or time.time() - seen > 5:
+        return None
+    encoded = np.frombuffer(data, dtype=np.uint8)
+    return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
+def read_exact(conn, length):
+    chunks = bytearray()
+    while len(chunks) < length:
+        chunk = conn.recv(length - len(chunks))
+        if not chunk:
+            return None
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+def start_camera_stream_server():
+    """Receive length-prefixed JPEG frames from ESP32-CAM on port 8081."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(('0.0.0.0', CAMERA_STREAM_PORT))
+    server.listen(5)
+    print(f"[CAM] TCP frame stream listening on 0.0.0.0:{CAMERA_STREAM_PORT}")
+
+    while True:
+        conn, addr = server.accept()
+        print(f"[CAM] Stream connected from {addr[0]}:{addr[1]}")
+        target = cameras.get("cam_1")
+        try:
+            while True:
+                header = read_exact(conn, 4)
+                if header is None:
+                    break
+                length = struct.unpack('<I', header)[0]
+                if length == 0 or length > 200_000:
+                    continue
+                jpeg = read_exact(conn, length)
+                if jpeg is None:
+                    break
+                if target:
+                    with target.lock:
+                        target.tcp_frame = jpeg
+                        target.tcp_seen = time.time()
+                        target.error = None
+        except Exception as exc:
+            print(f"[CAM] Stream error: {exc}")
+        finally:
+            conn.close()
+            print("[CAM] Stream disconnected")
 
 def detect_blockage(frame):
     """
@@ -266,6 +318,48 @@ def detect_blockage(frame):
 
     return blocked, debris_count, closest_dist, annotated
 
+# ─────────────────────────────────────────────
+# MLX90640 THERMAL FRAME RENDERING
+# ─────────────────────────────────────────────
+THERMAL_W        = 32     # MLX90640 native width
+THERMAL_H        = 24     # MLX90640 native height
+THERMAL_MIN_C    = 10.0   # colour-scale floor (°C)
+THERMAL_MAX_C    = 60.0   # colour-scale ceiling (°C)
+THERMAL_SCALE    = 10     # upscale factor for the preview image
+
+def render_thermal(frame_values):
+    """
+    Convert a flat 32x24 MLX90640 frame (list of °C) into a JPEG heatmap.
+    Returns (jpeg_bytes, min_c, max_c) or (None, None, None) on failure.
+    """
+    try:
+        arr = np.array(frame_values, dtype=np.float32).reshape((THERMAL_H, THERMAL_W))
+    except (ValueError, TypeError):
+        return None, None, None
+
+    arr[arr < -40.0] = np.nan                      # drop failed / invalid pixels
+    valid = arr[~np.isnan(arr)]
+    if valid.size == 0:
+        return None, None, None
+
+    vmin = min(float(valid.min()), THERMAL_MIN_C)
+    vmax = max(float(valid.max()), THERMAL_MAX_C)
+    if vmax - vmin < 1e-3:
+        vmax = vmin + 1.0
+
+    norm = np.nan_to_num((arr - vmin) / (vmax - vmin), nan=0.0)
+    norm = np.clip(norm * 255.0, 0, 255).astype(np.uint8)
+
+    heat = cv2.applyColorMap(norm, cv2.COLORMAP_INFERNO)
+    heat = cv2.resize(heat, (THERMAL_W * THERMAL_SCALE, THERMAL_H * THERMAL_SCALE),
+                      interpolation=cv2.INTER_LINEAR)
+
+    ok, jpeg = cv2.imencode('.jpg', heat, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    if not ok:
+        return None, None, None
+
+    return jpeg.tobytes(), float(valid.min()), float(valid.max())
+
 def camera_loop(cam):
     """Background thread — runs detection continuously for one camera."""
     print(f"[CAM] {cam.name} detection started")
@@ -275,7 +369,9 @@ def camera_loop(cam):
             time.sleep(2)
             continue
 
-        frame = fetch_frame(cam.url)
+        frame = fetch_tcp_frame(cam)
+        if frame is None and cam.url:
+            frame = fetch_frame(cam.url)
 
         if frame is None:
             with cam.lock:
@@ -305,13 +401,13 @@ def camera_loop(cam):
                 cmd = auto_determine_sign(node)
                 node.send_command(cmd)
                 socketio.emit('node_update', node.to_dict())
-                print(f"[CAM] {cam.name} → BLOCKED → Node {cam.node_id} → {cmd}")
+                print(f"[CAM] {cam.name} -> BLOCKED -> Node {cam.node_id} -> {cmd}")
             elif not blocked and node.blocked:
                 node.blocked = False
                 cmd = auto_determine_sign(node)
                 node.send_command(cmd)
                 socketio.emit('node_update', node.to_dict())
-                print(f"[CAM] {cam.name} → CLEAR  → Node {cam.node_id} → {cmd}")
+                print(f"[CAM] {cam.name} -> CLEAR  -> Node {cam.node_id} -> {cmd}")
 
         # Emit camera update to dashboard
         socketio.emit('camera_update', cam.to_dict())
@@ -349,7 +445,7 @@ def get_connected_devices():
                                     device_type = 'esp32'
                                     break
                             for cam in cameras.values():
-                                if cam.url.startswith(f"http://{ip}"):
+                                if cam.url and cam.url.startswith(f"http://{ip}"):
                                     node_name   = cam.name
                                     device_type = 'camera'
                                     break
@@ -390,7 +486,7 @@ def get_connected_devices():
                         device_type = 'esp32'
                         break
                 for cam in cameras.values():
-                    if cam.url.startswith(f"http://{ip}"):
+                    if cam.url and cam.url.startswith(f"http://{ip}"):
                         node_name   = cam.name
                         device_type = 'camera'
                         break
@@ -442,18 +538,7 @@ def find_node_by_ip(ip):
 def handle_esp32_connection(conn, addr):
     client_ip = addr[0]
     node      = find_node_by_ip(client_ip)
-
-    if not node:
-        print(f"[!] Unknown ESP32 from {client_ip}")
-        conn.close()
-        return
-
-    print(f"[+] {node.name} connected from {client_ip}")
-    with node.lock:
-        node.conn      = conn
-        node.connected = True
-
-    socketio.emit('node_update', node.to_dict())
+    registered = False
 
     try:
         buffer = ""
@@ -471,9 +556,48 @@ def handle_esp32_connection(conn, addr):
 
                 try:
                     sensor_data = json.loads(line)
+                    if not isinstance(sensor_data, dict):
+                        raise ValueError("Sensor payload must be a JSON object")
+
+                    reported_id = sensor_data.get("node_id")
+                    if reported_id:
+                        reported_node = nodes.get(reported_id)
+                        if not reported_node:
+                            print(f"[!] Unknown node ID {reported_id!r} from {client_ip}")
+                            return
+                        if registered and node is not reported_node:
+                            print(f"[!] Node ID changed on connection from {client_ip}")
+                            return
+                        node = reported_node
+
+                    if not node:
+                        print(f"[!] Unknown ESP32 from {client_ip}; send a configured node_id")
+                        return
+
+                    if not registered:
+                        with node.lock:
+                            node.ip        = client_ip
+                            node.conn      = conn
+                            node.connected = True
+                        registered = True
+                        print(f"[+] {node.name} connected from {client_ip}")
+                        socketio.emit('node_update', node.to_dict())
+
+                    # Render the thermal frame outside the lock (it is CPU-bound)
+                    frame    = sensor_data.get("thermal_frame")
+                    thermal_img = thermal_min = thermal_max = None
+                    if isinstance(frame, list) and len(frame) == THERMAL_W * THERMAL_H:
+                        thermal_img, thermal_min, thermal_max = render_thermal(frame)
+
                     with node.lock:
                         node.temperature = sensor_data.get("temp",     node.temperature)
                         node.seismic     = sensor_data.get("seismic",  node.seismic)
+                        node.thermal     = sensor_data.get("thermal",  node.thermal)
+                        if thermal_img:
+                            node.thermal_img  = thermal_img
+                            node.thermal_min  = round(thermal_min, 1)
+                            node.thermal_max  = round(thermal_max, 1)
+                            node.thermal_last = time.strftime("%H:%M:%S")
                         # Only update blocked from sensor if no camera is watching this node
                         cam_watching = any(c.node_id == node.id for c in cameras.values() if c.enabled)
                         if not cam_watching:
@@ -487,6 +611,17 @@ def handle_esp32_connection(conn, addr):
                 except (json.JSONDecodeError, ValueError):
                     try:
                         temp = float(line)
+                        if not node:
+                            print(f"[!] Unknown ESP32 from {client_ip}; send JSON with node_id")
+                            return
+                        if not registered:
+                            with node.lock:
+                                node.ip        = client_ip
+                                node.conn      = conn
+                                node.connected = True
+                            registered = True
+                            print(f"[+] {node.name} connected from {client_ip}")
+                            socketio.emit('node_update', node.to_dict())
                         with node.lock:
                             node.temperature = temp
                             node.last_seen   = time.strftime("%H:%M:%S")
@@ -497,13 +632,17 @@ def handle_esp32_connection(conn, addr):
                         print(f"[{node.name}] Unparseable: {line}")
 
     except Exception as e:
-        print(f"[{node.name}] Error: {e}")
+        name = node.name if node else client_ip
+        print(f"[{name}] Error: {e}")
     finally:
-        print(f"[-] {node.name} disconnected")
-        with node.lock:
-            node.connected = False
-            node.conn      = None
-        socketio.emit('node_update', node.to_dict())
+        if registered and node:
+            print(f"[-] {node.name} disconnected")
+            with node.lock:
+                if node.conn is conn:
+                    node.connected = False
+                    node.conn      = None
+            socketio.emit('node_update', node.to_dict())
+        conn.close()
 
 def auto_determine_sign(node):
     if node.blocked:
@@ -559,6 +698,37 @@ def camera_feed(cam_id):
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
             time.sleep(0.1)
+
+    return Response(generate(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/api/node/<node_id>/thermal')
+def node_thermal(node_id):
+    """Single latest thermal JPEG for a node."""
+    node = nodes.get(node_id)
+    if not node:
+        return "Node not found", 404
+    with node.lock:
+        img = node.thermal_img
+    if not img:
+        return "No thermal data", 404
+    return Response(img, mimetype='image/jpeg')
+
+@app.route('/api/node/<node_id>/thermal/feed')
+def node_thermal_feed(node_id):
+    """Live MJPEG thermal preview for a node."""
+    node = nodes.get(node_id)
+    if not node:
+        return "Node not found", 404
+
+    def generate():
+        while True:
+            with node.lock:
+                img = node.thermal_img
+            if img:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + img + b'\r\n')
+            time.sleep(0.2)
 
     return Response(generate(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -686,7 +856,7 @@ HTML_TEMPLATE = """
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>GaKuna Control</title>
-<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;400;600;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="/static/socketio.min.js"></script>
 <style>
   :root {
@@ -834,6 +1004,122 @@ HTML_TEMPLATE = """
   ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  /* ══════════════════════════════════════════════
+     PROFESSIONAL THEME (overrides) — flat, modern
+     ══════════════════════════════════════════════ */
+  :root {
+    --bg: #0e1116; --surface: #161a21; --surface2: #1c212a;
+    --border: #262c36; --accent: #4c8dff; --accent2: #7aa2f7;
+    --warn: #d29922; --danger: #f85149; --text: #e6e9ef; --muted: #8b95a5;
+    --success: #3fb950;
+    --left-color: #4c8dff; --right-color: #a371f7;
+    --stop-color: #f85149; --off-color: #8b95a5;
+  }
+  .icon { width: 1em; height: 1em; display: inline-block; vertical-align: -0.14em; flex-shrink: 0; }
+  body { font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif; background: var(--bg); font-size: 14px; }
+  body::before { display: none; }
+  button { font-family: 'Inter', system-ui, sans-serif; }
+  .container { max-width: 1240px; }
+
+  .logo-text p, .status-bar, .broadcast-label, .node-ip, .node-status, .sign-label,
+  .sensor-value, .sensor-unit, .camera-node, .camera-stat-value, .camera-stat-label,
+  .toggle-cam-btn, .devices-title, .device-count, .devices-table-header, .device-ip,
+  .device-mac, .device-type, .device-alive, .empty-devices, .scan-info, .log-header,
+  .log-clear, #log-output, .last-seen, .badge, .pill, .card-sub, .stat-value,
+  .stat-label, .thermal-legend, .media-placeholder {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+  }
+
+  .logo-icon { width: 44px; height: 44px; border-radius: 11px; background: var(--surface2);
+               border: 1px solid var(--border); box-shadow: none; color: var(--accent); }
+  .logo-icon .icon { width: 24px; height: 24px; }
+  .logo-text h1 { font-size: 22px; font-weight: 700; letter-spacing: 0.4px;
+                  background: none; -webkit-text-fill-color: currentColor; color: var(--text); }
+  .logo-text p { font-size: 11px; letter-spacing: 1.5px; color: var(--muted); text-transform: none; }
+  .status-dot { background: var(--success); box-shadow: none; }
+  .status-bar { color: var(--muted); letter-spacing: 0.5px; }
+
+  .tabs { gap: 2px; }
+  .tab-btn { display: inline-flex; align-items: center; gap: 8px; border-radius: 8px 8px 0 0;
+             font-weight: 500; letter-spacing: 0.2px; text-transform: none; font-size: 13.5px; }
+  .tab-btn .icon { width: 16px; height: 16px; }
+  .tab-btn.active { color: var(--text); border-bottom-color: var(--accent); }
+
+  .broadcast-bar { border-radius: 14px; }
+  .btn { display: inline-flex; align-items: center; gap: 7px; border-radius: 8px;
+         font-weight: 500; letter-spacing: 0.2px; text-transform: none; font-size: 13px;
+         padding: 9px 16px; }
+  .btn .icon { width: 15px; height: 15px; }
+  .btn-left, .btn-right, .btn-stop, .btn-off, .btn-clear, .btn-scan {
+    background: var(--surface2); border: 1px solid var(--border); box-shadow: none; }
+  .btn-left  { color: var(--left-color); }
+  .btn-right { color: var(--right-color); }
+  .btn-stop  { color: var(--danger); }
+  .btn-off   { color: var(--muted); }
+  .btn-clear { color: var(--success); }
+  .btn-scan  { color: var(--accent); }
+  .btn-left:hover, .btn-right:hover, .btn-stop:hover, .btn-off:hover,
+  .btn-clear:hover, .btn-scan:hover { background: #232a34; border-color: #333c48; box-shadow: none; }
+
+  .node-card, .camera-card, .devices-table, .log-section, .thermal-card {
+    border-radius: 14px; background: var(--surface); border: 1px solid var(--border); }
+  .node-card.connected { border-color: #2f3a48; box-shadow: none; }
+  .node-card.override-active { border-color: rgba(210,153,34,0.55); box-shadow: none; }
+  .node-header, .camera-header, .log-header { background: var(--surface2); }
+  .conn-dot.online, .alive-dot.online { background: var(--success); box-shadow: none; animation: pulse 2s infinite; }
+
+  .sign-icon { border-radius: 12px; box-shadow: none !important; }
+  .sign-icon .icon { width: 34px; height: 34px; }
+  .sign-icon.LEFT  { background: rgba(76,141,255,0.12);  border-color: rgba(76,141,255,0.35); }
+  .sign-icon.RIGHT { background: rgba(163,113,247,0.12); border-color: rgba(163,113,247,0.35); }
+  .sign-icon.STOP  { background: rgba(248,81,73,0.12);   border-color: rgba(248,81,73,0.35); }
+  .sign-icon.OFF   { background: var(--surface2);        border-color: var(--border); }
+  .sign-state { font-weight: 700; }
+
+  .auto-badge, .override-badge, .blocked-badge, .clear-badge, .device-count {
+    display: inline-flex; align-items: center; gap: 6px; letter-spacing: 0.5px; font-weight: 500; }
+  .auto-badge .icon, .override-badge .icon,
+  .blocked-badge .icon, .clear-badge .icon { width: 12px; height: 12px; }
+  .auto-badge     { background: rgba(63,185,80,0.12);  border: 1px solid rgba(63,185,80,0.30);  color: var(--success); }
+  .override-badge { background: rgba(210,153,34,0.12); border: 1px solid rgba(210,153,34,0.30); color: var(--warn); }
+  .clear-badge    { background: rgba(63,185,80,0.12);  border: 1px solid rgba(63,185,80,0.30);  color: var(--success); }
+  .blocked-badge  { background: rgba(248,81,73,0.12);  border: 1px solid rgba(248,81,73,0.30);  color: var(--danger); }
+  .device-count   { background: var(--surface2); border: 1px solid var(--border); color: var(--muted); }
+
+  .sensor-value { font-size: 17px; }
+  .sensor-value.normal { color: var(--accent); }
+  .sensor-value.danger { color: var(--danger); }
+  .sensor-value.warn   { color: var(--warn); }
+  .camera-feed, .camera-feed-placeholder { height: 240px; }
+  .toggle-cam-btn { background: var(--surface2); border-color: var(--border); }
+  .toggle-cam-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .log-clear { background: var(--surface2); border-color: var(--border); }
+
+  /* THERMAL TAB */
+  .thermal-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 20px; }
+  .thermal-card { overflow: hidden; }
+  .card-title { font-weight: 600; font-size: 14px; }
+  .card-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .pill { font-size: 10px; padding: 3px 9px; border-radius: 20px; letter-spacing: 0.5px;
+          text-transform: uppercase; border: 1px solid var(--border); color: var(--muted);
+          background: var(--surface2); }
+  .pill-live { color: var(--success); border-color: rgba(63,185,80,0.30); background: rgba(63,185,80,0.12); }
+  .thermal-view { position: relative; background: #05070a; }
+  .thermal-feed { width: 100%; height: 240px; object-fit: cover; display: block; }
+  .media-placeholder { position: absolute; inset: 0; display: flex; align-items: center;
+                       justify-content: center; background: var(--surface2); color: var(--muted); font-size: 12px; }
+  .stat-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px;
+              background: var(--border); border-top: 1px solid var(--border); }
+  .stat { background: var(--surface); padding: 12px; text-align: center; }
+  .stat-value { font-size: 17px; color: var(--text); }
+  .stat-label { font-size: 10px; color: var(--muted); text-transform: uppercase;
+                letter-spacing: 1px; margin-top: 3px; }
+  .thermal-legend { display: flex; align-items: center; gap: 10px; padding: 12px 20px 16px;
+                    font-size: 11px; color: var(--muted); }
+  .legend-bar { flex: 1; height: 8px; border-radius: 4px;
+                background: linear-gradient(90deg, #000004, #420a68, #932667, #dd513a, #fca50a, #fcffa4); }
+
   @media (max-width: 600px) {
     .broadcast-bar { flex-direction: column; align-items: flex-start; }
     header { flex-direction: column; gap: 12px; align-items: flex-start; }
@@ -843,11 +1129,29 @@ HTML_TEMPLATE = """
 </style>
 </head>
 <body>
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+  <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></symbol>
+  <symbol id="i-flame" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></symbol>
+  <symbol id="i-arrow-left" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></symbol>
+  <symbol id="i-arrow-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></symbol>
+  <symbol id="i-octagon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"/><path d="M9 12h6"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/></symbol>
+  <symbol id="i-rotate" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></symbol>
+  <symbol id="i-scan" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4M12 17h.01"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></symbol>
+  <symbol id="i-thermometer" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+</svg>
 <div class="container">
 
   <header>
     <div class="logo">
-      <div class="logo-icon">🚨</div>
+      <div class="logo-icon"><svg class="icon"><use href="#i-shield"/></svg></div>
       <div class="logo-text">
         <h1>GAKUNA</h1>
         <p>Dynamic Evacuation Control System</p>
@@ -860,21 +1164,22 @@ HTML_TEMPLATE = """
   </header>
 
   <div class="tabs">
-    <button class="tab-btn active" onclick="switchTab('nodes',   this)">⬡ Nodes</button>
-    <button class="tab-btn"        onclick="switchTab('cameras', this)">⬡ Cameras</button>
-    <button class="tab-btn"        onclick="switchTab('devices', this)">⬡ Devices</button>
+    <button class="tab-btn active" onclick="switchTab('nodes',   this)"><svg class="icon"><use href="#i-cpu"/></svg>Nodes</button>
+    <button class="tab-btn"        onclick="switchTab('cameras', this)"><svg class="icon"><use href="#i-camera"/></svg>Cameras</button>
+    <button class="tab-btn"        onclick="switchTab('thermal', this)"><svg class="icon"><use href="#i-flame"/></svg>Thermal</button>
+    <button class="tab-btn"        onclick="switchTab('devices', this)"><svg class="icon"><use href="#i-list"/></svg>Devices</button>
   </div>
 
   <!-- TAB: NODES -->
   <div class="tab-panel active" id="tab-nodes">
     <div class="broadcast-bar">
-      <span class="broadcast-label">⬡ Broadcast All</span>
+      <span class="broadcast-label">Broadcast All</span>
       <div class="btn-group">
-        <button class="btn btn-left"  onclick="broadcastAll('LEFT')">← Left</button>
-        <button class="btn btn-right" onclick="broadcastAll('RIGHT')">Right →</button>
-        <button class="btn btn-stop"  onclick="broadcastAll('STOP')">✕ Stop</button>
-        <button class="btn btn-off"   onclick="broadcastAll('OFF')">○ Off</button>
-        <button class="btn btn-clear" onclick="clearAllOverrides()">↺ Auto All</button>
+        <button class="btn btn-left"  onclick="broadcastAll('LEFT')"><svg class="icon"><use href="#i-arrow-left"/></svg>Left</button>
+        <button class="btn btn-right" onclick="broadcastAll('RIGHT')">Right<svg class="icon"><use href="#i-arrow-right"/></svg></button>
+        <button class="btn btn-stop"  onclick="broadcastAll('STOP')"><svg class="icon"><use href="#i-octagon"/></svg>Stop</button>
+        <button class="btn btn-off"   onclick="broadcastAll('OFF')"><svg class="icon"><use href="#i-power"/></svg>Off</button>
+        <button class="btn btn-clear" onclick="clearAllOverrides()"><svg class="icon"><use href="#i-rotate"/></svg>Auto All</button>
       </div>
     </div>
 
@@ -892,11 +1197,11 @@ HTML_TEMPLATE = """
           </div>
         </div>
         <div class="sign-display">
-          <div class="sign-icon OFF" id="sign-icon-{{ node.id }}">○</div>
+          <div class="sign-icon OFF" id="sign-icon-{{ node.id }}"></div>
           <div class="sign-info">
             <div class="sign-label">Current Sign</div>
             <div class="sign-state OFF" id="sign-state-{{ node.id }}">OFF</div>
-            <span class="auto-badge" id="mode-badge-{{ node.id }}">● AUTO</span>
+            <span class="auto-badge" id="mode-badge-{{ node.id }}"><svg class="icon"><use href="#i-rotate"/></svg>AUTO</span>
           </div>
         </div>
         <div class="sensor-grid">
@@ -910,11 +1215,11 @@ HTML_TEMPLATE = """
           </div>
         </div>
         <div class="node-controls">
-          <button class="btn btn-left btn-sm"  onclick="sendCommand('{{ node.id }}', 'LEFT')">← Left</button>
-          <button class="btn btn-right btn-sm" onclick="sendCommand('{{ node.id }}', 'RIGHT')">Right →</button>
-          <button class="btn btn-stop btn-sm"  onclick="sendCommand('{{ node.id }}', 'STOP')">✕ Stop</button>
-          <button class="btn btn-off btn-sm"   onclick="sendCommand('{{ node.id }}', 'OFF')">○ Off</button>
-          <button class="btn btn-clear btn-sm" onclick="clearOverride('{{ node.id }}')">↺ Auto</button>
+          <button class="btn btn-left btn-sm"  onclick="sendCommand('{{ node.id }}', 'LEFT')"><svg class="icon"><use href="#i-arrow-left"/></svg>Left</button>
+          <button class="btn btn-right btn-sm" onclick="sendCommand('{{ node.id }}', 'RIGHT')">Right<svg class="icon"><use href="#i-arrow-right"/></svg></button>
+          <button class="btn btn-stop btn-sm"  onclick="sendCommand('{{ node.id }}', 'STOP')"><svg class="icon"><use href="#i-octagon"/></svg>Stop</button>
+          <button class="btn btn-off btn-sm"   onclick="sendCommand('{{ node.id }}', 'OFF')"><svg class="icon"><use href="#i-power"/></svg>Off</button>
+          <button class="btn btn-clear btn-sm" onclick="clearOverride('{{ node.id }}')"><svg class="icon"><use href="#i-rotate"/></svg>Auto</button>
           <span class="last-seen" id="lastseen-{{ node.id }}"></span>
         </div>
       </div>
@@ -923,7 +1228,7 @@ HTML_TEMPLATE = """
 
     <div class="log-section">
       <div class="log-header">
-        <span>⬡ Event Log</span>
+        <span style="display:inline-flex;align-items:center;gap:8px;"><svg class="icon"><use href="#i-activity"/></svg>Event Log</span>
         <button class="log-clear" onclick="clearLog()">CLEAR</button>
       </div>
       <div id="log-output"></div>
@@ -940,16 +1245,26 @@ HTML_TEMPLATE = """
     </div>
   </div>
 
+  <!-- TAB: THERMAL -->
+  <div class="tab-panel" id="tab-thermal">
+    <div class="thermal-grid" id="thermal-grid">
+      <!-- Populated by JS -->
+    </div>
+    <div id="no-thermal" style="display:none; padding:48px; text-align:center; color:var(--muted); font-family:'JetBrains Mono',monospace;">
+      No nodes with a thermal sensor configured
+    </div>
+  </div>
+
   <!-- TAB: DEVICES -->
   <div class="tab-panel" id="tab-devices">
     <div class="devices-header">
       <div>
-        <div class="devices-title">⬡ Devices on Hotspot</div>
+        <div class="devices-title" style="display:inline-flex;align-items:center;gap:8px;"><svg class="icon"><use href="#i-list"/></svg>Devices on Hotspot</div>
         <div class="scan-info" id="last-scan-time">Scanning every 10 seconds</div>
       </div>
       <div style="display:flex;align-items:center;gap:12px;">
         <span class="device-count" id="device-count">0 devices</span>
-        <button class="btn btn-scan" onclick="triggerScan()">↺ Scan Now</button>
+        <button class="btn btn-scan" onclick="triggerScan()"><svg class="icon"><use href="#i-scan"/></svg>Scan Now</button>
       </div>
     </div>
     <div class="devices-table">
@@ -970,7 +1285,8 @@ HTML_TEMPLATE = """
 
 <script>
   const socket = io();
-  const SIGN_ICONS = { LEFT: '←', RIGHT: '→', STOP: '✕', OFF: '○' };
+  const SIGN_ICON_ID = { LEFT: 'i-arrow-left', RIGHT: 'i-arrow-right', STOP: 'i-octagon', OFF: 'i-power' };
+  const svgIcon = (id, cls = 'icon') => `<svg class="${cls}"><use href="#${id}"/></svg>`;
 
   // ── TABS ───────────────────────────────────
   function switchTab(name, btn) {
@@ -1006,13 +1322,15 @@ HTML_TEMPLATE = """
 
     const sign = node.current_sign || 'OFF';
     signIcon.className   = `sign-icon ${sign}`;
-    signIcon.textContent = SIGN_ICONS[sign] || '○';
+    signIcon.innerHTML   = svgIcon(SIGN_ICON_ID[sign] || 'i-power');
     signState.className  = `sign-state ${sign}`;
     signState.textContent = sign;
 
     card.classList.toggle('override-active', node.override);
     modeBadge.className   = node.override ? 'override-badge' : 'auto-badge';
-    modeBadge.textContent = node.override ? '⚠ OVERRIDE' : '● AUTO';
+    modeBadge.innerHTML   = node.override
+      ? svgIcon('i-alert') + 'OVERRIDE'
+      : svgIcon('i-rotate') + 'AUTO';
 
     if (node.temperature != null) {
       const t = parseFloat(node.temperature).toFixed(1);
@@ -1024,6 +1342,64 @@ HTML_TEMPLATE = """
       blockedEl.className   = 'sensor-value ' + (node.blocked ? 'danger' : 'normal');
     }
     if (node.last_seen) lastSeen.textContent = node.last_seen;
+
+    updateThermalCard(node);
+  }
+
+  // ── THERMAL CARDS ──────────────────────────
+  const thermalCards = {};
+
+  function updateThermalCard(node) {
+    let card = thermalCards[node.id];
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'thermal-card';
+      card.id = `tcard-${node.id}`;
+      card.innerHTML = `
+        <div class="node-header">
+          <div>
+            <div class="card-title">${node.name}</div>
+            <div class="card-sub">MLX90640 thermal camera</div>
+          </div>
+          <span class="pill" id="t-status-${node.id}">No data</span>
+        </div>
+        <div class="thermal-view">
+          <img class="thermal-feed" id="tfeed-${node.id}" alt="Thermal preview">
+          <div class="media-placeholder" id="tph-${node.id}">Waiting for thermal data...</div>
+        </div>
+        <div class="stat-row">
+          <div class="stat"><div class="stat-value" id="t-hot-${node.id}">--</div><div class="stat-label">Hotspot &deg;C</div></div>
+          <div class="stat"><div class="stat-value" id="t-min-${node.id}">--</div><div class="stat-label">Min &deg;C</div></div>
+          <div class="stat"><div class="stat-value" id="t-amb-${node.id}">--</div><div class="stat-label">Ambient &deg;C</div></div>
+        </div>
+        <div class="thermal-legend"><span>10&deg;C</span><div class="legend-bar"></div><span>60&deg;C+</span></div>
+      `;
+      document.getElementById('thermal-grid').appendChild(card);
+      document.getElementById('no-thermal').style.display = 'none';
+      thermalCards[node.id] = card;
+    }
+
+    const status = document.getElementById(`t-status-${node.id}`);
+    const img    = document.getElementById(`tfeed-${node.id}`);
+    const ph     = document.getElementById(`tph-${node.id}`);
+
+    if (node.has_thermal) {
+      if (!img.dataset.started) {
+        img.dataset.started = '1';
+        img.src = `/api/node/${node.id}/thermal/feed`;
+        img.onload = () => { ph.style.display = 'none'; };
+      }
+      ph.style.display = 'none';
+      status.className = 'pill pill-live';
+      status.textContent = 'Live';
+    }
+
+    const hot = document.getElementById(`t-hot-${node.id}`);
+    const min = document.getElementById(`t-min-${node.id}`);
+    const amb = document.getElementById(`t-amb-${node.id}`);
+    if (node.thermal_max != null) hot.textContent = parseFloat(node.thermal_max).toFixed(1);
+    if (node.thermal_min != null) min.textContent = parseFloat(node.thermal_min).toFixed(1);
+    if (node.temperature != null) amb.textContent = parseFloat(node.temperature).toFixed(1);
   }
 
   // ── CAMERA CARDS ───────────────────────────
@@ -1069,8 +1445,8 @@ HTML_TEMPLATE = """
           </div>
         </div>
         <div class="camera-footer">
-          <span class="clear-badge" id="cam-status-${cam.id}">● CLEAR</span>
-          <span style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--muted)" id="cam-error-${cam.id}"></span>
+          <span class="clear-badge" id="cam-status-${cam.id}">${svgIcon('i-check')}CLEAR</span>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--muted)" id="cam-error-${cam.id}"></span>
         </div>
       `;
       grid.appendChild(card);
@@ -1092,7 +1468,7 @@ HTML_TEMPLATE = """
 
     if (statusEl) {
       statusEl.className   = cam.blocked ? 'blocked-badge' : 'clear-badge';
-      statusEl.textContent = cam.blocked ? '⚠ BLOCKED' : '● CLEAR';
+      statusEl.innerHTML   = cam.blocked ? svgIcon('i-alert') + 'BLOCKED' : svgIcon('i-check') + 'CLEAR';
     }
 
     if (errorEl) errorEl.textContent = cam.error ?? '';
@@ -1100,7 +1476,7 @@ HTML_TEMPLATE = """
     card.classList.toggle('blocked-active', cam.blocked);
 
     if (cam.blocked) {
-      addLog(`Camera ${cam.name} detected blockage → Node ${cam.node_id} set to STOP`, 'cam');
+      addLog(`Camera ${cam.name} detected blockage -> Node ${cam.node_id} set to STOP`, 'cam');
     }
   }
 
@@ -1149,7 +1525,7 @@ HTML_TEMPLATE = """
   // ── NODE CONTROLS ──────────────────────────
   function sendCommand(nodeId, command) {
     socket.emit('send_command', { node_id: nodeId, command });
-    addLog(`Override: ${nodeId} → ${command}`, 'cmd');
+    addLog(`Override: ${nodeId} -> ${command}`, 'cmd');
   }
   function clearOverride(nodeId) {
     socket.emit('clear_override', { node_id: nodeId });
@@ -1157,11 +1533,11 @@ HTML_TEMPLATE = """
   }
   function broadcastAll(command) {
     socket.emit('send_command', { node_id: 'all', command });
-    addLog(`Broadcast ALL → ${command}`, 'cmd');
+    addLog(`Broadcast ALL -> ${command}`, 'cmd');
   }
   function clearAllOverrides() {
     socket.emit('clear_override', { node_id: 'all' });
-    addLog('All nodes → AUTO mode', 'conn');
+    addLog('All nodes -> AUTO mode', 'conn');
   }
 
   // ── LOG ────────────────────────────────────
@@ -1191,6 +1567,11 @@ if __name__ == '__main__':
     tcp_thread.daemon = True
     tcp_thread.start()
 
+    # TCP server for ESP32-CAM JPEG frames
+    camera_stream_thread = threading.Thread(target=start_camera_stream_server)
+    camera_stream_thread.daemon = True
+    camera_stream_thread.start()
+
     # Device scanner
     scan_thread = threading.Thread(target=scan_devices_loop)
     scan_thread.daemon = True
@@ -1209,6 +1590,7 @@ if __name__ == '__main__':
     print("=" * 50)
     print(f"  Dashboard:  http://0.0.0.0:8080")
     print(f"  ESP32 TCP:  0.0.0.0:{ESP32_SERVER_PORT}")
+    print(f"  ESP32-CAM stream: 0.0.0.0:{CAMERA_STREAM_PORT}")
     print(f"  Focal Len:  {FOCAL_LENGTH:.1f}px")
     print(f"  Cameras:    {len([c for c in cameras.values() if c.enabled])} active")
     print("=" * 50)

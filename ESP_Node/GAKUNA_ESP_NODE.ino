@@ -1,18 +1,23 @@
-#include <OneWire.h>
-#include <DallasTemperature.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_MLX90640.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <ArduinoJson.h>
 #include <SoftwareSerial.h>
 #include <DFRobotDFPlayerMini.h>
 
-// ─── PIN CONFIG ───────────────────────────────
-const int ONE_WIRE_BUS = 15;   // DS18B20 temperature sensor
-const int LEFT_LED     = 25;    // Left arrow LED
-const int CROSS_LED    = 26;    // Stop/Cross LED
-const int RIGHT_LED    = 27;    // Right arrow LED
-const int DF_RX_PIN    = 16;   // DFPlayer TX → ESP32 RX (GPIO16)
-const int DF_TX_PIN    = 17;   // DFPlayer RX → ESP32 TX (GPIO17)
+// ─── PIN CONFIG (GaKuna node ESP32) ───────────
+const int DHT_PIN      = 4;    // DHT22 temperature/humidity data (4.7–10k pull-up to 3.3V)
+#define   DHT_TYPE     DHT22
+const int LEFT_LED     = 18;   // Green LED #1 (left arrow) — via transistor
+const int CROSS_LED    = 23;   // Red LED (stop/cross) — via transistor
+const int RIGHT_LED    = 19;   // Green LED #2 (right arrow) — via transistor
+const int DF_RX_PIN    = 16;   // DFPlayer TX → ESP32 RX (Serial2)
+const int DF_TX_PIN    = 17;   // DFPlayer RX → ESP32 TX (Serial2, 1kΩ series)
+const int MLX_SDA_PIN  = 21;   // MLX90640 SDA (I2C)
+const int MLX_SCL_PIN  = 22;   // MLX90640 SCL (I2C)
+const uint8_t MLX_ADDR = 0x33; // MLX90640 default I2C address
 
 // ─── AUDIO TRACK MAPPING ─────────────────────
 // Put these files on your SD card in /mp3/ folder:
@@ -28,12 +33,15 @@ const int DF_TX_PIN    = 17;   // DFPlayer RX → ESP32 TX (GPIO17)
 // ─── NETWORK CONFIG ───────────────────────────
 const char* SSID        = "gakunapi_wifi";
 const char* PASSWORD    = "gakunapass";
-const char* PI_IP       = "10.42.0.1";
+const char* PI_IP       = "192.168.4.1";
 const int   PI_PORT     = 5001;   // Must match ESP32_SERVER_PORT in server.py
+const char* NODE_ID     = "node_1"; // Must match an ID in the server's NODE_CONFIG
 
 // ─── OBJECTS ──────────────────────────────────
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature tempSensor(&oneWire);
+DHT dht(DHT_PIN, DHT_TYPE);
+Adafruit_MLX90640 mlx;
+float mlxFrame[32 * 24];          // 32x24 thermal frame (°C)
+bool  mlxReady = false;
 SoftwareSerial dfSerial(DF_RX_PIN, DF_TX_PIN);
 DFRobotDFPlayerMini dfPlayer;
 WiFiClient client;
@@ -66,6 +74,22 @@ void playAudio(String command) {
     else if (command == "OFF")   dfPlayer.stop();
 }
 
+float readThermalMax() {
+    // Returns hottest valid pixel temperature (°C), or NAN on failure
+    if (!mlxReady) return NAN;
+    if (mlx.getFrame(mlxFrame) != 0) {
+        Serial.println("MLX90640 frame read failed!");
+        return NAN;
+    }
+    float maxT = -1000.0;
+    for (int i = 0; i < 32 * 24; i++) {
+        float t = mlxFrame[i];
+        if (isnan(t) || t < -40.0 || t > 300.0) continue;  // skip bad pixels
+        if (t > maxT) maxT = t;
+    }
+    return (maxT > -1000.0) ? maxT : NAN;
+}
+
 void connectToWiFi() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(SSID, PASSWORD);
@@ -91,7 +115,20 @@ void setup() {
     Serial.begin(115200);
 
     // Temperature sensor
-    tempSensor.begin();
+    dht.begin();
+
+    // MLX90640 thermal sensor (I2C)
+    Wire.begin(MLX_SDA_PIN, MLX_SCL_PIN);
+    Wire.setClock(400000);
+    if (!mlx.begin(MLX_ADDR, &Wire)) {
+        Serial.println("MLX90640 not found — check wiring!");
+    } else {
+        mlx.setMode(MLX90640_CHESS);
+        mlx.setResolution(MLX90640_ADC_18BIT);
+        mlx.setRefreshRate(MLX90640_8_HZ);
+        mlxReady = true;
+        Serial.println("MLX90640 ready.");
+    }
 
     // LED pins
     pinMode(LEFT_LED,  OUTPUT);
@@ -132,15 +169,33 @@ void loop() {
     if (now - lastSend >= SEND_INTERVAL) {
         lastSend = now;
 
-        // Read temperature
-        tempSensor.requestTemperatures();
-        float tempC = tempSensor.getTempCByIndex(0);
+        // Read temperature (DHT22)
+        float tempC = dht.readTemperature();
+        if (isnan(tempC)) {
+            Serial.println("DHT22 read failed!");
+            tempC = -127.0;  // Keep payload valid for server.py
+        }
+
+        // Read thermal hotspot (MLX90640)
+        float thermalMax = readThermalMax();
 
         // Build JSON — matches what server.py expects
-        StaticJsonDocument<128> doc;
+        DynamicJsonDocument doc(8192);
+        doc["node_id"] = NODE_ID;
         doc["temp"]    = tempC;
+        doc["thermal"] = isnan(thermalMax) ? -127.0 : thermalMax;
         doc["seismic"] = 0.0;    // Placeholder — add MPU6050 reading here later
         doc["blocked"] = false;  // Placeholder — add HC-SR04 reading here later
+
+        // Full 32x24 frame so the Pi can render a thermal preview
+        if (mlxReady) {
+            JsonArray tf = doc.createNestedArray("thermal_frame");
+            for (int i = 0; i < 32 * 24; i++) {
+                float t = mlxFrame[i];
+                if (isnan(t) || t < -40.0 || t > 300.0) tf.add(-127);
+                else                                     tf.add((int)roundf(t));
+            }
+        }
 
         String payload;
         serializeJson(doc, payload);
