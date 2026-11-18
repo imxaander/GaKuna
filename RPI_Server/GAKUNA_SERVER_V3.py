@@ -55,6 +55,14 @@ CAMERA_CONFIG = [
         "node_id":    "node_1",
         "enabled":    True,
     },
+    # Add one entry per additional camera and set its firmware CAMERA_ID to match.
+    # {
+    #     "id":         "cam_2",
+    #     "name":       "Camera - Node 12",
+    #     "url":        None,
+    #     "node_id":    "node_2",
+    #     "enabled":    True,
+    # },
 ]
 
 # ─────────────────────────────────────────────
@@ -96,6 +104,8 @@ class CameraState:
         self.latest_frame   = None   # JPEG bytes for live view
         self.tcp_frame      = None   # Raw JPEG received from ESP32-CAM
         self.tcp_seen       = 0.0
+        self.tcp_sequence   = 0
+        self.tcp_processed  = 0
         self.lock           = threading.Lock()
 
     def to_dict(self):
@@ -206,8 +216,10 @@ def fetch_tcp_frame(cam):
     with cam.lock:
         data = cam.tcp_frame
         seen = cam.tcp_seen
-    if data is None or time.time() - seen > 5:
-        return None
+        sequence = cam.tcp_sequence
+        if data is None or sequence == cam.tcp_processed or time.time() - seen > 5:
+            return None
+        cam.tcp_processed = sequence
     encoded = np.frombuffer(data, dtype=np.uint8)
     return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
 
@@ -220,8 +232,56 @@ def read_exact(conn, length):
         chunks.extend(chunk)
     return bytes(chunks)
 
+def handle_camera_stream(conn, addr):
+    """Receive a camera ID followed by length-prefixed JPEG frames."""
+    target = None
+    try:
+        conn.settimeout(15)
+        id_length_data = read_exact(conn, 1)
+        if id_length_data is None:
+            return
+        id_length = id_length_data[0]
+        if id_length == 0 or id_length > 32:
+            raise ValueError(f"Invalid camera ID length: {id_length}")
+
+        id_data = read_exact(conn, id_length)
+        if id_data is None:
+            return
+        camera_id = id_data.decode('ascii')
+        target = cameras.get(camera_id)
+        if target is None:
+            raise ValueError(f"Unknown camera ID {camera_id!r}")
+
+        print(f"[CAM] {target.name} stream connected from {addr[0]}:{addr[1]}")
+        with target.lock:
+            target.ip = addr[0]
+
+        while True:
+            header = read_exact(conn, 4)
+            if header is None:
+                break
+            length = struct.unpack('<I', header)[0]
+            if length == 0 or length > 200_000:
+                raise ValueError(f"Invalid JPEG frame size: {length}")
+            jpeg = read_exact(conn, length)
+            if jpeg is None:
+                break
+            with target.lock:
+                target.tcp_frame = jpeg
+                target.tcp_seen = time.time()
+                target.tcp_sequence += 1
+                target.error = None
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        print(f"[CAM] Stream error from {addr[0]}: {exc}")
+    finally:
+        conn.close()
+        if target:
+            print(f"[CAM] {target.name} stream disconnected")
+        else:
+            print(f"[CAM] Unregistered stream disconnected: {addr[0]}")
+
 def start_camera_stream_server():
-    """Receive length-prefixed JPEG frames from ESP32-CAM on port 8081."""
+    """Accept ESP32-CAM streams on port 8081."""
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(('0.0.0.0', CAMERA_STREAM_PORT))
@@ -230,32 +290,10 @@ def start_camera_stream_server():
 
     while True:
         conn, addr = server.accept()
-        print(f"[CAM] Stream connected from {addr[0]}:{addr[1]}")
-        target = cameras.get("cam_1")
-        if target:
-            with target.lock:
-                target.ip = addr[0]
-        try:
-            while True:
-                header = read_exact(conn, 4)
-                if header is None:
-                    break
-                length = struct.unpack('<I', header)[0]
-                if length == 0 or length > 200_000:
-                    continue
-                jpeg = read_exact(conn, length)
-                if jpeg is None:
-                    break
-                if target:
-                    with target.lock:
-                        target.tcp_frame = jpeg
-                        target.tcp_seen = time.time()
-                        target.error = None
-        except Exception as exc:
-            print(f"[CAM] Stream error: {exc}")
-        finally:
-            conn.close()
-            print("[CAM] Stream disconnected")
+        stream_thread = threading.Thread(
+            target=handle_camera_stream, args=(conn, addr), daemon=True
+        )
+        stream_thread.start()
 
 def detect_blockage(frame):
     """
@@ -390,14 +428,21 @@ def camera_loop(cam):
 
         if frame is None:
             with cam.lock:
-                cam.error = "Cannot reach camera"
-            time.sleep(2)
+                stream_recent = cam.tcp_frame is not None and time.time() - cam.tcp_seen <= 5
+                if not stream_recent:
+                    cam.error = "Cannot reach camera"
+            time.sleep(0.05 if stream_recent else 2)
             continue
 
         blocked, debris_count, closest, annotated = detect_blockage(frame)
 
         # Encode annotated frame as JPEG for live view
-        _, jpeg = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        encoded, jpeg = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if not encoded:
+            with cam.lock:
+                cam.error = "Could not encode preview frame"
+            time.sleep(0.1)
+            continue
 
         with cam.lock:
             cam.blocked        = blocked
@@ -427,8 +472,7 @@ def camera_loop(cam):
         # Emit camera update to dashboard
         socketio.emit('camera_update', cam.to_dict())
 
-        # Capture every 2 seconds — balances responsiveness vs power
-        time.sleep(2)
+        time.sleep(0.1)
 
 # ─────────────────────────────────────────────
 # CONNECTED DEVICES SCANNER

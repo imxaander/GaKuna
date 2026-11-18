@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include "esp_wifi.h"
+#include <string.h>
 
 // ─── CAMERA PINS (AI Thinker ESP32-CAM) ──────
 #define PWDN_GPIO_NUM     32
@@ -26,6 +27,7 @@ const char* SSID          = "gakunapi_wifi";
 const char* PASSWORD      = "gakunapass";
 const char* STREAM_HOST   = "192.168.1.13";
 const uint16_t STREAM_PORT = 8081;
+const char* CAMERA_ID     = "cam_1"; // Must match an ID in the server's CAMERA_CONFIG
 
 // ─── WEB SERVER ───────────────────────────────
 WebServer server(80);
@@ -36,13 +38,33 @@ void ensureStreamConnection() {
     streamClient.stop();
     Serial.printf("[CAM] Connecting to frame stream %s:%u\n",
                   STREAM_HOST, STREAM_PORT);
-    streamClient.connect(STREAM_HOST, STREAM_PORT);
+    if (!streamClient.connect(STREAM_HOST, STREAM_PORT)) return;
+
+    size_t idLength = strlen(CAMERA_ID);
+    if (idLength == 0 || idLength > 32) {
+        Serial.println("[CAM] Invalid CAMERA_ID length");
+        streamClient.stop();
+        return;
+    }
+
+    uint8_t idLengthByte = (uint8_t)idLength;
+    if (streamClient.write(&idLengthByte, sizeof(idLengthByte)) != sizeof(idLengthByte) ||
+        streamClient.write((const uint8_t*)CAMERA_ID, idLength) != idLength) {
+        Serial.println("[CAM] Failed to send camera ID");
+        streamClient.stop();
+        return;
+    }
+    Serial.printf("[CAM] Stream connected as %s\n", CAMERA_ID);
 }
 
 void sendStreamFrame(camera_fb_t* fb) {
     if (!fb) return;
     ensureStreamConnection();
     if (!streamClient.connected()) return;
+    if (fb->len == 0 || fb->len > 200000) {
+        Serial.printf("[CAM] Skipping invalid frame size: %u\n", (unsigned)fb->len);
+        return;
+    }
 
     uint32_t length = fb->len;
     uint8_t header[4] = {
@@ -51,13 +73,16 @@ void sendStreamFrame(camera_fb_t* fb) {
         (uint8_t)((length >> 16) & 0xff),
         (uint8_t)((length >> 24) & 0xff)
     };
-    streamClient.write(header, sizeof(header));
-    streamClient.write(fb->buf, fb->len);
+    if (streamClient.write(header, sizeof(header)) != sizeof(header) ||
+        streamClient.write(fb->buf, fb->len) != fb->len) {
+        Serial.println("[CAM] Frame send failed; reconnecting");
+        streamClient.stop();
+    }
 }
 
 // ─── CAMERA INIT ──────────────────────────────
 void initCamera() {
-    camera_config_t config;
+    camera_config_t config = {};
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer   = LEDC_TIMER_0;
     config.pin_d0       = Y2_GPIO_NUM;
@@ -79,15 +104,14 @@ void initCamera() {
     config.xclk_freq_hz = 20000000;
     config.pixel_format = PIXFORMAT_JPEG;
     config.frame_size   = FRAMESIZE_QVGA;  // 320x240
-    config.jpeg_quality = 15;
+    config.jpeg_quality = 20;
 
-    // Frame buffering — 2 PSRAM buffers avoid cam_hal: FB-OVF while serving
     if (psramFound()) {
-        config.fb_count    = 2;
+        config.fb_count    = 1;
         config.fb_location = CAMERA_FB_IN_PSRAM;
-        config.grab_mode   = CAMERA_GRAB_LATEST;
+        config.grab_mode   = CAMERA_GRAB_WHEN_EMPTY;
     } else {
-        Serial.println("[CAM] WARNING: PSRAM not found — enable it in Tools menu");
+        Serial.println("[CAM] WARNING: PSRAM not found — using one DRAM frame buffer");
         config.fb_count    = 1;
         config.fb_location = CAMERA_FB_IN_DRAM;
         config.grab_mode   = CAMERA_GRAB_WHEN_EMPTY;
@@ -180,5 +204,5 @@ void loop() {
             esp_camera_fb_return(fb);
         }
     }
-    delay(50);
+    delay(100);
 }
