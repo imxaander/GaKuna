@@ -10,8 +10,11 @@ Access dashboard at: http://<pi-ip>:8080
 import socket
 import threading
 import json
+import os
+import sqlite3
 import struct
 import time
+from contextlib import closing
 import subprocess
 import re
 import urllib.request
@@ -32,10 +35,37 @@ socketio = SocketIO(
 # ─────────────────────────────────────────────
 # NODE CONFIGURATION
 # ─────────────────────────────────────────────
-NODE_CONFIG = [
+DEFAULT_NODE_CONFIG = [
     {"id": "node_1", "name": "Node 11 - Floor 1 Left",   "ip": "DHCP", "port": 5001},
     {"id": "node_2", "name": "Node 12 - Floor 1 Left",   "ip": "DHCP", "port": 5001},
 ]
+NODE_DB_PATH = os.environ.get(
+    "GAKUNA_NODE_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "gakuna_nodes.db"),
+)
+
+def load_node_configs():
+    with closing(sqlite3.connect(NODE_DB_PATH)) as database:
+        with database:
+            database.execute("""
+                CREATE TABLE IF NOT EXISTS node_registry (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    ip TEXT NOT NULL,
+                    port INTEGER NOT NULL
+                )
+            """)
+            database.executemany(
+                "INSERT OR IGNORE INTO node_registry (id, name, ip, port) VALUES (?, ?, ?, ?)",
+                [(node["id"], node["name"], node["ip"], node["port"]) for node in DEFAULT_NODE_CONFIG],
+            )
+            database.row_factory = sqlite3.Row
+            rows = database.execute(
+                "SELECT id, name, ip, port FROM node_registry ORDER BY rowid"
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+NODE_CONFIG = load_node_configs()
 
 # Listen on all interfaces; ESP32s connect to the Pi's router-assigned address.
 PI_HOST = '0.0.0.0'
@@ -213,6 +243,17 @@ class NodeState:
         return False
 
 nodes = {cfg["id"]: NodeState(cfg) for cfg in NODE_CONFIG}
+nodes_lock = threading.RLock()
+
+def node_snapshot():
+    with nodes_lock:
+        return list(nodes.values())
+
+def get_node(node_id):
+    if not isinstance(node_id, str):
+        return None
+    with nodes_lock:
+        return nodes.get(node_id)
 
 # ─────────────────────────────────────────────
 # OPENCV DETECTION FUNCTIONS
@@ -475,7 +516,7 @@ def camera_loop(cam):
             cam.latest_frame   = jpeg.tobytes()
 
         # Update the node this camera monitors
-        node = nodes.get(cam.node_id)
+        node = get_node(cam.node_id)
         if node and not node.override:
             # Camera blockage overrides sensor blockage
             if blocked and not node.blocked:
@@ -520,7 +561,7 @@ def get_connected_devices():
                                 continue
                             node_name   = 'Unknown Device'
                             device_type = 'unknown'
-                            for node in nodes.values():
+                            for node in node_snapshot():
                                 if node.ip == ip:
                                     node_name   = node.name
                                     device_type = 'esp32'
@@ -561,7 +602,7 @@ def get_connected_devices():
                     continue
                 node_name   = 'Unknown Device'
                 device_type = 'unknown'
-                for node in nodes.values():
+                for node in node_snapshot():
                     if node.ip == ip:
                         node_name   = node.name
                         device_type = 'esp32'
@@ -611,7 +652,7 @@ def scan_devices_loop():
 # TCP SERVER
 # ─────────────────────────────────────────────
 def find_node_by_ip(ip):
-    for node in nodes.values():
+    for node in node_snapshot():
         if node.ip == ip:
             return node
     return None
@@ -642,7 +683,7 @@ def handle_esp32_connection(conn, addr):
 
                     reported_id = sensor_data.get("node_id")
                     if reported_id:
-                        reported_node = nodes.get(reported_id)
+                        reported_node = get_node(reported_id)
                         if not reported_node:
                             print(f"[!] Unknown node ID {reported_id!r} from {client_ip}")
                             return
@@ -756,13 +797,48 @@ def start_tcp_server():
 def index():
     return render_template_string(
         HTML_TEMPLATE,
-        nodes=list(nodes.values()),
+        nodes=node_snapshot(),
         sound_tracks=SOUND_TRACKS,
     )
 
 @app.route('/api/nodes')
 def api_nodes():
-    return jsonify([n.to_dict() for n in nodes.values()])
+    return jsonify([n.to_dict() for n in node_snapshot()])
+
+@app.route('/api/nodes', methods=['POST'])
+def api_add_node():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected a JSON object"}), 400
+
+    node_id = data.get('id')
+    name = data.get('name')
+    if not isinstance(node_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', node_id):
+        return jsonify({"error": "Node ID must be 1-32 letters, numbers, underscores, or hyphens"}), 400
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
+        return jsonify({"error": "Node name must be between 1 and 80 characters"}), 400
+
+    config = {
+        "id": node_id,
+        "name": name.strip(),
+        "ip": "DHCP",
+        "port": ESP32_SERVER_PORT,
+    }
+    node = NodeState(config)
+    try:
+        with nodes_lock:
+            with closing(sqlite3.connect(NODE_DB_PATH)) as database:
+                with database:
+                    database.execute(
+                        "INSERT INTO node_registry (id, name, ip, port) VALUES (?, ?, ?, ?)",
+                        (config["id"], config["name"], config["ip"], config["port"]),
+                    )
+            nodes[node_id] = node
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "A node with that ID already exists"}), 409
+
+    socketio.emit('nodes_changed')
+    return jsonify({"status": "created", "node": node.to_dict()}), 201
 
 @app.route('/api/cameras')
 def api_cameras():
@@ -790,7 +866,7 @@ def camera_feed(cam_id):
 @app.route('/api/node/<node_id>/thermal')
 def node_thermal(node_id):
     """Single latest thermal JPEG for a node."""
-    node = nodes.get(node_id)
+    node = get_node(node_id)
     if not node:
         return "Node not found", 404
     with node.lock:
@@ -802,7 +878,7 @@ def node_thermal(node_id):
 @app.route('/api/node/<node_id>/thermal/feed')
 def node_thermal_feed(node_id):
     """Live MJPEG thermal preview for a node."""
-    node = nodes.get(node_id)
+    node = get_node(node_id)
     if not node:
         return "Node not found", 404
 
@@ -852,7 +928,7 @@ def api_command():
 
     if node_id == 'all':
         results = {}
-        for node in nodes.values():
+        for node in node_snapshot():
             node.override         = True
             node.override_command = command
             ok                    = node.send_command(command)
@@ -860,15 +936,15 @@ def api_command():
             socketio.emit('node_update', node.to_dict())
         return jsonify({"status": "broadcast", "results": results})
 
-    elif node_id in nodes:
-        node                  = nodes[node_id]
+    else:
+        node = get_node(node_id)
+        if not node:
+            return jsonify({"error": "Node not found"}), 404
         node.override         = True
         node.override_command = command
         ok                    = node.send_command(command)
         socketio.emit('node_update', node.to_dict())
         return jsonify({"status": "ok", "sent": ok})
-
-    return jsonify({"error": "Node not found"}), 404
 
 @app.route('/api/sound', methods=['POST'])
 def api_sound():
@@ -885,13 +961,13 @@ def api_sound():
         return jsonify({"error": "Node not found"}), 404
 
     if node_id == 'all':
-        results = {node.id: node.send_sound(track) for node in nodes.values()}
+        results = {node.id: node.send_sound(track) for node in node_snapshot()}
         return jsonify({"status": "broadcast", "track": track, "results": results})
 
-    if node_id not in nodes:
+    node = get_node(node_id)
+    if not node:
         return jsonify({"error": "Node not found"}), 404
-
-    sent = nodes[node_id].send_sound(track)
+    sent = node.send_sound(track)
     return jsonify({"status": "ok", "track": track, "sent": sent})
 
 @app.route('/api/override/clear', methods=['POST'])
@@ -900,24 +976,24 @@ def clear_override():
     node_id = data.get('node_id')
 
     if node_id == 'all':
-        for node in nodes.values():
+        for node in node_snapshot():
             node.override = False
             socketio.emit('node_update', node.to_dict())
         return jsonify({"status": "all overrides cleared"})
 
-    elif node_id in nodes:
-        nodes[node_id].override = False
-        socketio.emit('node_update', nodes[node_id].to_dict())
-        return jsonify({"status": "override cleared"})
-
-    return jsonify({"error": "Node not found"}), 404
+    node = get_node(node_id)
+    if not node:
+        return jsonify({"error": "Node not found"}), 404
+    node.override = False
+    socketio.emit('node_update', node.to_dict())
+    return jsonify({"status": "override cleared"})
 
 # ─────────────────────────────────────────────
 # SOCKETIO EVENTS
 # ─────────────────────────────────────────────
 @socketio.on('connect')
 def on_connect():
-    for node in nodes.values():
+    for node in node_snapshot():
         emit('node_update', node.to_dict())
     for cam in cameras.values():
         emit('camera_update', cam.to_dict())
@@ -930,7 +1006,7 @@ def on_send_command(data):
     command = data.get('command', '').upper()
     if command not in VALID_COMMANDS:
         return
-    target_nodes = list(nodes.values()) if node_id == 'all' else [nodes.get(node_id)]
+    target_nodes = node_snapshot() if node_id == 'all' else [get_node(node_id)]
     target_nodes = [n for n in target_nodes if n]
     for node in target_nodes:
         node.override         = True
@@ -948,14 +1024,14 @@ def on_play_sound(data):
         return
     if node_id != 'all' and not isinstance(node_id, str):
         return
-    target_nodes = list(nodes.values()) if node_id == 'all' else [nodes.get(node_id)]
+    target_nodes = node_snapshot() if node_id == 'all' else [get_node(node_id)]
     for node in (n for n in target_nodes if n):
         node.send_sound(track)
 
 @socketio.on('clear_override')
 def on_clear_override(data):
     node_id      = data.get('node_id')
-    target_nodes = list(nodes.values()) if node_id == 'all' else [nodes.get(node_id)]
+    target_nodes = node_snapshot() if node_id == 'all' else [get_node(node_id)]
     target_nodes = [n for n in target_nodes if n]
     for node in target_nodes:
         node.override = False
@@ -1032,6 +1108,15 @@ HTML_TEMPLATE = """
   .btn-off:hover   { background: rgba(125,133,144,0.3); }
   .btn-clear:hover { background: rgba(0,255,136,0.2); box-shadow: 0 0 12px rgba(0,255,136,0.2); }
   .btn-scan:hover  { background: rgba(0,170,255,0.2); box-shadow: 0 0 12px rgba(0,170,255,0.2); }
+
+  .node-registry { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 18px 24px; margin-bottom: 20px; }
+  .node-registry-title { font-size: 13px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; }
+  .node-registry-help { color: var(--muted); font-size: 11px; margin: 4px 0 14px; }
+  .node-add-form { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+  .node-add-field { display: flex; flex-direction: column; gap: 5px; font-size: 11px; color: var(--muted); }
+  .node-add-field input { min-width: 190px; padding: 9px 11px; background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: 7px; font: inherit; }
+  .node-add-field input:focus { outline: none; border-color: var(--accent); }
+  .node-add-status { min-height: 16px; margin-top: 8px; color: var(--danger); font-size: 11px; }
 
   /* NODE CARDS */
   .nodes-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 20px; }
@@ -1306,6 +1391,23 @@ HTML_TEMPLATE = """
       </div>
     </div>
 
+    <div class="node-registry">
+      <div class="node-registry-title">Node Registry</div>
+      <div class="node-registry-help">The node ID must match NODE_ID in the ESP32 firmware.</div>
+      <form id="add-node-form" class="node-add-form">
+        <label class="node-add-field">
+          Node ID
+          <input name="id" required maxlength="32" pattern="[A-Za-z0-9_-]{1,32}" placeholder="node_3">
+        </label>
+        <label class="node-add-field">
+          Display name
+          <input name="name" required maxlength="80" placeholder="Node 13 - Floor 2">
+        </label>
+        <button class="btn btn-clear" type="submit">Add Node</button>
+      </form>
+      <div class="node-add-status" id="node-add-status" role="status" aria-live="polite"></div>
+    </div>
+
     <div class="nodes-grid" id="nodes-grid">
       {% for node in nodes %}
       <div class="node-card" id="card-{{ node.id }}">
@@ -1416,6 +1518,9 @@ HTML_TEMPLATE = """
   const socket = io();
   const SIGN_ICON_ID = { LEFT: 'i-arrow-left', RIGHT: 'i-arrow-right', STOP: 'i-octagon', OFF: 'i-power' };
   const svgIcon = (id, cls = 'icon') => `<svg class="${cls}"><use href="#${id}"/></svg>`;
+  const escapeHtml = value => String(value).replace(/[&<>"']/g, character => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[character]));
 
   // ── TABS ───────────────────────────────────
   function switchTab(name, btn) {
@@ -1429,6 +1534,7 @@ HTML_TEMPLATE = """
   socket.on('connect',    () => addLog('Connected to GaKuna server', 'conn'));
   socket.on('disconnect', () => addLog('Disconnected from server',   'err'));
   socket.on('node_update',    node    => updateNodeCard(node));
+  socket.on('nodes_changed', () => window.location.reload());
   socket.on('camera_update',  cam     => updateCameraCard(cam));
   socket.on('devices_update', devices => renderDevices(devices));
 
@@ -1487,7 +1593,7 @@ HTML_TEMPLATE = """
       card.innerHTML = `
         <div class="node-header">
           <div>
-            <div class="card-title">${node.name}</div>
+            <div class="card-title"></div>
             <div class="card-sub">MLX90640 thermal camera</div>
           </div>
           <span class="pill" id="t-status-${node.id}">No data</span>
@@ -1503,6 +1609,7 @@ HTML_TEMPLATE = """
         </div>
         <div class="thermal-legend"><span>10&deg;C</span><div class="legend-bar"></div><span>60&deg;C+</span></div>
       `;
+      card.querySelector('.card-title').textContent = node.name;
       document.getElementById('thermal-grid').appendChild(card);
       document.getElementById('no-thermal').style.display = 'none';
       thermalCards[node.id] = card;
@@ -1613,6 +1720,33 @@ HTML_TEMPLATE = """
     socket.emit('toggle_camera', { cam_id: camId });
   }
 
+  document.getElementById('add-node-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const status = document.getElementById('node-add-status');
+    const submit = form.querySelector('button[type="submit"]');
+    const values = new FormData(form);
+    submit.disabled = true;
+    status.textContent = '';
+
+    try {
+      const response = await fetch('/api/nodes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: values.get('id'),
+          name: values.get('name')
+        })
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Could not add node');
+      window.location.reload();
+    } catch (error) {
+      status.textContent = error.message;
+      submit.disabled = false;
+    }
+  });
+
   // ── DEVICES ────────────────────────────────
   function renderDevices(devices) {
     const list  = document.getElementById('devices-list');
@@ -1629,12 +1763,12 @@ HTML_TEMPLATE = """
 
     list.innerHTML = devices.map(d => `
       <div class="device-row">
-        <div class="device-ip">${d.ip}</div>
-        <div class="device-mac">${d.mac}</div>
+        <div class="device-ip">${escapeHtml(d.ip)}</div>
+        <div class="device-mac">${escapeHtml(d.mac)}</div>
         <div class="device-name" style="color:${d.type==='esp32'?'var(--accent2)':d.type==='camera'?'#aa00ff':'var(--text)'}">
-          ${d.node_name}
+          ${escapeHtml(d.node_name)}
         </div>
-        <div><span class="device-type ${d.type}">${d.type==='esp32'?'ESP32':d.type==='camera'?'CAM':'Device'}</span></div>
+        <div><span class="device-type ${escapeHtml(d.type)}">${d.type==='esp32'?'ESP32':d.type==='camera'?'CAM':'Device'}</span></div>
         <div class="device-alive">
           <div class="alive-dot ${d.alive?'online':'offline'}"></div>
           <span style="color:${d.alive?'var(--accent)':'var(--muted)'}">${d.alive?'Online':'Offline'}</span>

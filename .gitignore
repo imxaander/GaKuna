@@ -15,6 +15,7 @@ Unity/Assets/AssetStoreTools*
 __pycache__/
 *.py[cod]
 *.egg-info/
+RPI_Server/gakuna_nodes.db
 .venv/
 venv/
 env/
