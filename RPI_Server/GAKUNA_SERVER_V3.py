@@ -41,7 +41,15 @@ NODE_CONFIG = [
 PI_HOST = '0.0.0.0'
 ESP32_SERVER_PORT = 5001
 CAMERA_STREAM_PORT = 8081
-VALID_COMMANDS    = ["LEFT", "RIGHT", "STOP", "OFF"]
+VALID_COMMANDS    = ["LEFT", "RIGHT", "STOP", "OFF", "DOWN", "UP", "OTHER_SIDE"]
+SOUND_TRACKS      = {
+    1: "Go left",
+    2: "Go right",
+    3: "Do not proceed here",
+    4: "Go down",
+    5: "Go up",
+    6: "Go to the other side",
+}
 
 # ─────────────────────────────────────────────
 # CAMERA CONFIGURATION
@@ -186,6 +194,20 @@ class NodeState:
                     return True
                 except Exception as e:
                     print(f"[{self.name}] Send error: {e}")
+                    self.connected = False
+                    self.conn      = None
+        return False
+
+    def send_sound(self, track):
+        if type(track) is not int or track not in SOUND_TRACKS:
+            return False
+        with self.lock:
+            if self.conn:
+                try:
+                    self.conn.send((f"PLAY:{track}\n").encode('utf-8'))
+                    return True
+                except Exception as e:
+                    print(f"[{self.name}] Sound send error: {e}")
                     self.connected = False
                     self.conn      = None
         return False
@@ -732,7 +754,11 @@ def start_tcp_server():
 # ─────────────────────────────────────────────
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE, nodes=list(nodes.values()))
+    return render_template_string(
+        HTML_TEMPLATE,
+        nodes=list(nodes.values()),
+        sound_tracks=SOUND_TRACKS,
+    )
 
 @app.route('/api/nodes')
 def api_nodes():
@@ -844,6 +870,30 @@ def api_command():
 
     return jsonify({"error": "Node not found"}), 404
 
+@app.route('/api/sound', methods=['POST'])
+def api_sound():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected a JSON object"}), 400
+    node_id = data.get('node_id')
+    track   = data.get('track')
+
+    if type(track) is not int or track not in SOUND_TRACKS:
+        return jsonify({"error": f"Invalid track. Use one of: {list(SOUND_TRACKS)}"}), 400
+
+    if node_id != 'all' and not isinstance(node_id, str):
+        return jsonify({"error": "Node not found"}), 404
+
+    if node_id == 'all':
+        results = {node.id: node.send_sound(track) for node in nodes.values()}
+        return jsonify({"status": "broadcast", "track": track, "results": results})
+
+    if node_id not in nodes:
+        return jsonify({"error": "Node not found"}), 404
+
+    sent = nodes[node_id].send_sound(track)
+    return jsonify({"status": "ok", "track": track, "sent": sent})
+
 @app.route('/api/override/clear', methods=['POST'])
 def clear_override():
     data    = request.json
@@ -887,6 +937,20 @@ def on_send_command(data):
         node.override_command = command
         node.send_command(command)
         socketio.emit('node_update', node.to_dict())
+
+@socketio.on('play_sound')
+def on_play_sound(data):
+    if not isinstance(data, dict):
+        return
+    node_id = data.get('node_id')
+    track   = data.get('track')
+    if type(track) is not int or track not in SOUND_TRACKS:
+        return
+    if node_id != 'all' and not isinstance(node_id, str):
+        return
+    target_nodes = list(nodes.values()) if node_id == 'all' else [nodes.get(node_id)]
+    for node in (n for n in target_nodes if n):
+        node.send_sound(track)
 
 @socketio.on('clear_override')
 def on_clear_override(data):
@@ -1281,6 +1345,12 @@ HTML_TEMPLATE = """
           <button class="btn btn-clear btn-sm" onclick="clearOverride('{{ node.id }}')"><svg class="icon"><use href="#i-rotate"/></svg>Auto</button>
           <span class="last-seen" id="lastseen-{{ node.id }}"></span>
         </div>
+        <div class="node-controls">
+          <span class="last-seen">Play sound:</span>
+          {% for track, label in sound_tracks.items() %}
+          <button class="btn btn-clear btn-sm" onclick="playSound('{{ node.id }}', {{ track }})">{{ label }}</button>
+          {% endfor %}
+        </div>
       </div>
       {% endfor %}
     </div>
@@ -1585,6 +1655,10 @@ HTML_TEMPLATE = """
   function sendCommand(nodeId, command) {
     socket.emit('send_command', { node_id: nodeId, command });
     addLog(`Override: ${nodeId} -> ${command}`, 'cmd');
+  }
+  function playSound(nodeId, track) {
+    socket.emit('play_sound', { node_id: nodeId, track });
+    addLog(`Play sound ${track} on ${nodeId}`, 'cmd');
   }
   function clearOverride(nodeId) {
     socket.emit('clear_override', { node_id: nodeId });

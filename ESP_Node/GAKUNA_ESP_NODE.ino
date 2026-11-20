@@ -23,11 +23,15 @@ const uint8_t MLX_ADDR = 0x33; // MLX90640 default I2C address
 // 0001.mp3 = "Go left."
 // 0002.mp3 = "Go right."
 // 0003.mp3 = "Do not proceed here."
-// 0004.mp3 = "Evacuate immediately."
+// 0004.mp3 = "Go down."
+// 0005.mp3 = "Go up."
+// 0006.mp3 = "Go to the other side."
 #define TRACK_LEFT   1
 #define TRACK_RIGHT  2
 #define TRACK_STOP   3
-#define TRACK_ALARM  4
+#define TRACK_DOWN   4
+#define TRACK_UP     5
+#define TRACK_OTHER_SIDE 6
 
 // ─── NETWORK CONFIG ───────────────────────────
 const char* SSID        = "gakunapi_wifi";
@@ -70,6 +74,9 @@ void playAudio(String command) {
     else if (command == "RIGHT") dfPlayer.play(TRACK_RIGHT);
     else if (command == "STOP")  dfPlayer.play(TRACK_STOP);
     else if (command == "OFF")   dfPlayer.stop();
+    else if (command == "DOWN")  dfPlayer.play(TRACK_DOWN);
+    else if (command == "UP")    dfPlayer.play(TRACK_UP);
+    else if (command == "OTHER_SIDE") dfPlayer.play(TRACK_OTHER_SIDE);
 }
 
 float readThermalMax() {
@@ -211,8 +218,19 @@ void loop() {
 
         if (command.length() > 0) {
             Serial.println("Command: " + command);
-            setLEDs(command);
-            //playAudio(command);
+            if (command.startsWith("PLAY:")) {
+                String trackText = command.substring(5);
+                int track = trackText.toInt();
+                if (track >= TRACK_LEFT && track <= TRACK_OTHER_SIDE &&
+                    trackText == String(track)) {
+                    dfPlayer.play(track);
+                } else {
+                    Serial.println("Invalid sound track.");
+                }
+            } else {
+                setLEDs(command);
+                playAudio(command);
+            }
         }
     }
 }
