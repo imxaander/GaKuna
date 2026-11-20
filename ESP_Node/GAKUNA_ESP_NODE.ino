@@ -38,7 +38,7 @@ const char* SSID        = "gakunapi_wifi";
 const char* PASSWORD    = "gakunapass";
 const char* PI_IP       = "192.168.1.13";
 const int   PI_PORT     = 5001;   // Must match ESP32_SERVER_PORT in server.py
-const char* NODE_ID     = "node_1"; // Must match an ID in the server's NODE_CONFIG
+const char* NODE_ID     = "node_1"; // Must match an ID in the server node registry
 
 // ─── OBJECTS ──────────────────────────────────
 DHT dht(DHT_PIN, DHT_TYPE);

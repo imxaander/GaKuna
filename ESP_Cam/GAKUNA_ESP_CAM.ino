@@ -27,7 +27,7 @@ const char* SSID          = "gakunapi_wifi";
 const char* PASSWORD      = "gakunapass";
 const char* STREAM_HOST   = "192.168.1.13";
 const uint16_t STREAM_PORT = 8081;
-const char* CAMERA_ID     = "cam_1"; // Must match an ID in the server's CAMERA_CONFIG
+const char* CAMERA_ID     = "cam_1"; // Must match an ID in the server camera registry
 
 // ─── WEB SERVER ───────────────────────────────
 WebServer server(80);

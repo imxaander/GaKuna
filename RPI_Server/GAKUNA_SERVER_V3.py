@@ -7,19 +7,21 @@ Run with: python3 server.py
 Access dashboard at: http://<pi-ip>:8080
 """
 
-import socket
-import threading
 import json
 import os
+import re
+import socket
 import sqlite3
 import struct
-import time
-from contextlib import closing
 import subprocess
-import re
+import threading
+import time
 import urllib.request
-import numpy as np
+from contextlib import closing
+from urllib.parse import urlparse
+
 import cv2
+import numpy as np
 from flask import Flask, render_template_string, jsonify, request, Response
 from flask_socketio import SocketIO, emit
 
@@ -39,13 +41,16 @@ DEFAULT_NODE_CONFIG = [
     {"id": "node_1", "name": "Node 11 - Floor 1 Left",   "ip": "DHCP", "port": 5001},
     {"id": "node_2", "name": "Node 12 - Floor 1 Left",   "ip": "DHCP", "port": 5001},
 ]
-NODE_DB_PATH = os.environ.get(
-    "GAKUNA_NODE_DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "gakuna_nodes.db"),
+DATABASE_PATH = os.environ.get(
+    "GAKUNA_DATABASE_PATH",
+    os.environ.get(
+        "GAKUNA_NODE_DB_PATH",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "gakuna_nodes.db"),
+    ),
 )
 
 def load_node_configs():
-    with closing(sqlite3.connect(NODE_DB_PATH)) as database:
+    with closing(sqlite3.connect(DATABASE_PATH)) as database:
         with database:
             database.execute("""
                 CREATE TABLE IF NOT EXISTS node_registry (
@@ -85,7 +90,7 @@ SOUND_TRACKS      = {
 # CAMERA CONFIGURATION
 # Each camera maps to a node it monitors
 # ─────────────────────────────────────────────
-CAMERA_CONFIG = [
+DEFAULT_CAMERA_CONFIG = [
     {
         "id":         "cam_1",
         "name":       "Camera - Node 11",
@@ -93,15 +98,43 @@ CAMERA_CONFIG = [
         "node_id":    "node_1",
         "enabled":    True,
     },
-    # Add one entry per additional camera and set its firmware CAMERA_ID to match.
-    # {
-    #     "id":         "cam_2",
-    #     "name":       "Camera - Node 12",
-    #     "url":        None,
-    #     "node_id":    "node_2",
-    #     "enabled":    True,
-    # },
 ]
+
+def load_camera_configs():
+    with closing(sqlite3.connect(DATABASE_PATH)) as database:
+        with database:
+            database.execute("""
+                CREATE TABLE IF NOT EXISTS camera_registry (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    url TEXT,
+                    node_id TEXT NOT NULL,
+                    enabled INTEGER NOT NULL
+                )
+            """)
+            database.executemany(
+                "INSERT OR IGNORE INTO camera_registry (id, name, url, node_id, enabled) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        camera["id"],
+                        camera["name"],
+                        camera["url"],
+                        camera["node_id"],
+                        int(camera["enabled"]),
+                    )
+                    for camera in DEFAULT_CAMERA_CONFIG
+                ],
+            )
+            database.row_factory = sqlite3.Row
+            rows = database.execute(
+                "SELECT id, name, url, node_id, enabled FROM camera_registry ORDER BY rowid"
+            ).fetchall()
+    return [
+        {**dict(row), "enabled": bool(row["enabled"])}
+        for row in rows
+    ]
+
+CAMERA_CONFIG = load_camera_configs()
 
 # ─────────────────────────────────────────────
 # OPENCV CALIBRATION SETTINGS
@@ -150,7 +183,6 @@ class CameraState:
         return {
             "id":             self.id,
             "name":           self.name,
-            "url":            self.url,
             "ip":             self.ip,
             "node_id":        self.node_id,
             "enabled":        self.enabled,
@@ -162,11 +194,23 @@ class CameraState:
         }
 
 cameras = {cfg["id"]: CameraState(cfg) for cfg in CAMERA_CONFIG}
+cameras_lock = threading.RLock()
+
+def camera_snapshot():
+    with cameras_lock:
+        return list(cameras.values())
+
+def get_camera(camera_id):
+    if not isinstance(camera_id, str):
+        return None
+    with cameras_lock:
+        return cameras.get(camera_id)
 
 def camera_matches_ip(cam, ip):
     with cam.lock:
         camera_ip = cam.ip
-    return camera_ip == ip or (cam.url and cam.url.startswith(f"http://{ip}"))
+    url_host = urlparse(cam.url).hostname if cam.url else None
+    return camera_ip == ip or url_host == ip
 
 # ─────────────────────────────────────────────
 # NODE STATE MANAGER
@@ -255,6 +299,9 @@ def get_node(node_id):
     with nodes_lock:
         return nodes.get(node_id)
 
+def valid_registry_id(value):
+    return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,32}', value) is not None
+
 # ─────────────────────────────────────────────
 # OPENCV DETECTION FUNCTIONS
 # ─────────────────────────────────────────────
@@ -311,7 +358,7 @@ def handle_camera_stream(conn, addr):
         if id_data is None:
             return
         camera_id = id_data.decode('ascii')
-        target = cameras.get(camera_id)
+        target = get_camera(camera_id)
         if target is None:
             raise ValueError(f"Unknown camera ID {camera_id!r}")
 
@@ -537,6 +584,14 @@ def camera_loop(cam):
 
         time.sleep(0.1)
 
+def start_camera_worker(cam):
+    threading.Thread(
+        target=camera_loop,
+        args=(cam,),
+        name=f"camera-{cam.id}",
+        daemon=True,
+    ).start()
+
 # ─────────────────────────────────────────────
 # CONNECTED DEVICES SCANNER
 # ─────────────────────────────────────────────
@@ -566,7 +621,7 @@ def get_connected_devices():
                                     node_name   = node.name
                                     device_type = 'esp32'
                                     break
-                            for cam in cameras.values():
+                            for cam in camera_snapshot():
                                 if camera_matches_ip(cam, ip):
                                     node_name   = cam.name
                                     device_type = 'camera'
@@ -607,7 +662,7 @@ def get_connected_devices():
                         node_name   = node.name
                         device_type = 'esp32'
                         break
-                for cam in cameras.values():
+                for cam in camera_snapshot():
                     if camera_matches_ip(cam, ip):
                         node_name   = cam.name
                         device_type = 'camera'
@@ -721,7 +776,7 @@ def handle_esp32_connection(conn, addr):
                             node.thermal_max  = round(thermal_max, 1)
                             node.thermal_last = time.strftime("%H:%M:%S")
                         # Only update blocked from sensor if no camera is watching this node
-                        cam_watching = any(c.node_id == node.id for c in cameras.values() if c.enabled)
+                        cam_watching = any(c.node_id == node.id for c in camera_snapshot() if c.enabled)
                         if not cam_watching:
                             node.blocked = sensor_data.get("blocked", node.blocked)
                         node.last_seen = time.strftime("%H:%M:%S")
@@ -813,7 +868,7 @@ def api_add_node():
 
     node_id = data.get('id')
     name = data.get('name')
-    if not isinstance(node_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', node_id):
+    if not valid_registry_id(node_id):
         return jsonify({"error": "Node ID must be 1-32 letters, numbers, underscores, or hyphens"}), 400
     if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
         return jsonify({"error": "Node name must be between 1 and 80 characters"}), 400
@@ -827,7 +882,7 @@ def api_add_node():
     node = NodeState(config)
     try:
         with nodes_lock:
-            with closing(sqlite3.connect(NODE_DB_PATH)) as database:
+            with closing(sqlite3.connect(DATABASE_PATH)) as database:
                 with database:
                     database.execute(
                         "INSERT INTO node_registry (id, name, ip, port) VALUES (?, ?, ?, ?)",
@@ -842,12 +897,81 @@ def api_add_node():
 
 @app.route('/api/cameras')
 def api_cameras():
-    return jsonify([c.to_dict() for c in cameras.values()])
+    return jsonify([c.to_dict() for c in camera_snapshot()])
+
+@app.route('/api/cameras', methods=['POST'])
+def api_add_camera():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected a JSON object"}), 400
+
+    camera_id = data.get('id')
+    name = data.get('name')
+    node_id = data.get('node_id')
+    url = data.get('url', '')
+    if not valid_registry_id(camera_id):
+        return jsonify({"error": "Camera ID must be 1-32 letters, numbers, underscores, or hyphens"}), 400
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
+        return jsonify({"error": "Camera name must be between 1 and 80 characters"}), 400
+    if not isinstance(node_id, str) or not get_node(node_id):
+        return jsonify({"error": "Select an existing node for this camera"}), 400
+    if url is None:
+        url = ''
+    if not isinstance(url, str):
+        return jsonify({"error": "Camera URL must be a string"}), 400
+    url = url.strip() or None
+    if url:
+        try:
+            parsed_url = urlparse(url)
+        except ValueError:
+            return jsonify({"error": "Camera URL must be a valid HTTP or HTTPS URL"}), 400
+        if parsed_url.scheme not in ("http", "https") or not parsed_url.hostname:
+            return jsonify({"error": "Camera URL must be a valid HTTP or HTTPS URL"}), 400
+        if parsed_url.username is not None or parsed_url.password is not None:
+            return jsonify({"error": "Camera URLs must not contain embedded credentials"}), 400
+
+    config = {
+        "id": camera_id,
+        "name": name.strip(),
+        "url": url,
+        "node_id": node_id,
+        "enabled": True,
+    }
+    camera = CameraState(config)
+    try:
+        with cameras_lock:
+            with closing(sqlite3.connect(DATABASE_PATH)) as database:
+                with database:
+                    database.execute(
+                        "INSERT INTO camera_registry (id, name, url, node_id, enabled) VALUES (?, ?, ?, ?, ?)",
+                        (config["id"], config["name"], config["url"], config["node_id"], 1),
+                    )
+            cameras[camera_id] = camera
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "A camera with that ID already exists"}), 409
+
+    start_camera_worker(camera)
+    socketio.emit('cameras_changed')
+    return jsonify({"status": "created", "camera": camera.to_dict()}), 201
+
+def toggle_camera_enabled(cam):
+    with cam.lock:
+        enabled = not cam.enabled
+        with closing(sqlite3.connect(DATABASE_PATH)) as database:
+            with database:
+                result = database.execute(
+                    "UPDATE camera_registry SET enabled = ? WHERE id = ?",
+                    (int(enabled), cam.id),
+                )
+                if result.rowcount != 1:
+                    raise RuntimeError(f"Camera {cam.id!r} is missing from the registry database")
+        cam.enabled = enabled
+    return enabled
 
 @app.route('/api/camera/<cam_id>/feed')
 def camera_feed(cam_id):
     """Live MJPEG feed for a specific camera — view in browser."""
-    cam = cameras.get(cam_id)
+    cam = get_camera(cam_id)
     if not cam:
         return "Camera not found", 404
 
@@ -896,12 +1020,12 @@ def node_thermal_feed(node_id):
 
 @app.route('/api/camera/<cam_id>/toggle', methods=['POST'])
 def toggle_camera(cam_id):
-    cam = cameras.get(cam_id)
+    cam = get_camera(cam_id)
     if not cam:
         return jsonify({"error": "Camera not found"}), 404
-    cam.enabled = not cam.enabled
+    enabled = toggle_camera_enabled(cam)
     socketio.emit('camera_update', cam.to_dict())
-    return jsonify({"status": "ok", "enabled": cam.enabled})
+    return jsonify({"status": "ok", "enabled": enabled})
 
 @app.route('/api/devices')
 def api_devices():
@@ -995,7 +1119,7 @@ def clear_override():
 def on_connect():
     for node in node_snapshot():
         emit('node_update', node.to_dict())
-    for cam in cameras.values():
+    for cam in camera_snapshot():
         emit('camera_update', cam.to_dict())
     with device_cache_lock:
         emit('devices_update', device_cache)
@@ -1040,9 +1164,9 @@ def on_clear_override(data):
 @socketio.on('toggle_camera')
 def on_toggle_camera(data):
     cam_id = data.get('cam_id')
-    cam    = cameras.get(cam_id)
+    cam    = get_camera(cam_id)
     if cam:
-        cam.enabled = not cam.enabled
+        toggle_camera_enabled(cam)
         socketio.emit('camera_update', cam.to_dict())
 
 # ─────────────────────────────────────────────
@@ -1083,7 +1207,7 @@ HTML_TEMPLATE = """
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
 
   /* TABS */
-  .tabs { display: flex; gap: 4px; margin-bottom: 28px; border-bottom: 1px solid var(--border); }
+  .tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 28px; border-bottom: 1px solid var(--border); }
   .tab-btn { padding: 10px 20px; background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted); font-family: 'Exo 2', sans-serif; font-size: 13px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; cursor: pointer; transition: all 0.2s; margin-bottom: -1px; }
   .tab-btn:hover { color: var(--text); }
   .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
@@ -1109,14 +1233,19 @@ HTML_TEMPLATE = """
   .btn-clear:hover { background: rgba(0,255,136,0.2); box-shadow: 0 0 12px rgba(0,255,136,0.2); }
   .btn-scan:hover  { background: rgba(0,170,255,0.2); box-shadow: 0 0 12px rgba(0,170,255,0.2); }
 
-  .node-registry { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 18px 24px; margin-bottom: 20px; }
-  .node-registry-title { font-size: 13px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; }
-  .node-registry-help { color: var(--muted); font-size: 11px; margin: 4px 0 14px; }
-  .node-add-form { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
-  .node-add-field { display: flex; flex-direction: column; gap: 5px; font-size: 11px; color: var(--muted); }
-  .node-add-field input { min-width: 190px; padding: 9px 11px; background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: 7px; font: inherit; }
-  .node-add-field input:focus { outline: none; border-color: var(--accent); }
-  .node-add-status { min-height: 16px; margin-top: 8px; color: var(--danger); font-size: 11px; }
+  .settings-intro { margin-bottom: 18px; }
+  .settings-intro h2 { font-size: 18px; }
+  .settings-intro p { margin-top: 5px; color: var(--muted); font-size: 12px; }
+  .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 18px; }
+  .settings-card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 20px; }
+  .settings-card h3 { font-size: 14px; margin-bottom: 5px; }
+  .settings-help { color: var(--muted); font-size: 11px; line-height: 1.5; margin-bottom: 16px; }
+  .settings-form { display: grid; gap: 12px; }
+  .settings-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .settings-field { display: flex; flex-direction: column; gap: 5px; font-size: 11px; color: var(--muted); }
+  .settings-field input, .settings-field select { width: 100%; padding: 9px 11px; background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: 7px; font: inherit; }
+  .settings-field input:focus, .settings-field select:focus { outline: none; border-color: var(--accent); }
+  .settings-status { min-height: 16px; color: var(--danger); font-size: 11px; }
 
   /* NODE CARDS */
   .nodes-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 20px; }
@@ -1330,6 +1459,7 @@ HTML_TEMPLATE = """
 
   @media (max-width: 600px) {
     .broadcast-bar { flex-direction: column; align-items: flex-start; }
+    .settings-grid, .settings-fields { grid-template-columns: 1fr; }
     header { flex-direction: column; gap: 12px; align-items: flex-start; }
     .devices-table-header, .device-row { grid-template-columns: 120px 1fr 80px 80px; }
     .device-mac { display: none; }
@@ -1376,6 +1506,7 @@ HTML_TEMPLATE = """
     <button class="tab-btn"        onclick="switchTab('cameras', this)"><svg class="icon"><use href="#i-camera"/></svg>Cameras</button>
     <button class="tab-btn"        onclick="switchTab('thermal', this)"><svg class="icon"><use href="#i-flame"/></svg>Thermal</button>
     <button class="tab-btn"        onclick="switchTab('devices', this)"><svg class="icon"><use href="#i-list"/></svg>Devices</button>
+    <button class="tab-btn"        onclick="switchTab('settings', this)">Settings</button>
   </div>
 
   <!-- TAB: NODES -->
@@ -1389,23 +1520,6 @@ HTML_TEMPLATE = """
         <button class="btn btn-off"   onclick="broadcastAll('OFF')"><svg class="icon"><use href="#i-power"/></svg>Off</button>
         <button class="btn btn-clear" onclick="clearAllOverrides()"><svg class="icon"><use href="#i-rotate"/></svg>Auto All</button>
       </div>
-    </div>
-
-    <div class="node-registry">
-      <div class="node-registry-title">Node Registry</div>
-      <div class="node-registry-help">The node ID must match NODE_ID in the ESP32 firmware.</div>
-      <form id="add-node-form" class="node-add-form">
-        <label class="node-add-field">
-          Node ID
-          <input name="id" required maxlength="32" pattern="[A-Za-z0-9_-]{1,32}" placeholder="node_3">
-        </label>
-        <label class="node-add-field">
-          Display name
-          <input name="name" required maxlength="80" placeholder="Node 13 - Floor 2">
-        </label>
-        <button class="btn btn-clear" type="submit">Add Node</button>
-      </form>
-      <div class="node-add-status" id="node-add-status" role="status" aria-live="polite"></div>
     </div>
 
     <div class="nodes-grid" id="nodes-grid">
@@ -1472,7 +1586,7 @@ HTML_TEMPLATE = """
       <!-- Populated by JS -->
     </div>
     <div id="no-cameras" style="display:none; padding:48px; text-align:center; color:var(--muted); font-family:'Share Tech Mono',monospace;">
-      No cameras configured in CAMERA_CONFIG
+      No cameras registered yet
     </div>
   </div>
 
@@ -1512,6 +1626,65 @@ HTML_TEMPLATE = """
     </div>
   </div>
 
+  <!-- TAB: SETTINGS -->
+  <div class="tab-panel" id="tab-settings">
+    <div class="settings-intro">
+      <h2>System Settings</h2>
+      <p>Register nodes and cameras. Settings are saved locally on this Raspberry Pi.</p>
+    </div>
+    <div class="settings-grid">
+      <section class="settings-card">
+        <h3>Add a node</h3>
+        <p class="settings-help">The node ID must match <code>NODE_ID</code> in its ESP32 firmware.</p>
+        <form id="add-node-form" class="settings-form">
+          <div class="settings-fields">
+            <label class="settings-field">
+              Node ID
+              <input name="id" required maxlength="32" pattern="[A-Za-z0-9_-]{1,32}" placeholder="node_3">
+            </label>
+            <label class="settings-field">
+              Display name
+              <input name="name" required maxlength="80" placeholder="Node 13 - Floor 2">
+            </label>
+          </div>
+          <button class="btn btn-clear" type="submit">Add Node</button>
+          <div class="settings-status" id="node-add-status" role="status" aria-live="polite"></div>
+        </form>
+      </section>
+
+      <section class="settings-card">
+        <h3>Add a camera</h3>
+        <p class="settings-help">The camera ID must match <code>CAMERA_ID</code> in its ESP32-CAM firmware. Leave URL blank for the TCP stream.</p>
+        <form id="add-camera-form" class="settings-form">
+          <div class="settings-fields">
+            <label class="settings-field">
+              Camera ID
+              <input name="id" required maxlength="32" pattern="[A-Za-z0-9_-]{1,32}" placeholder="cam_2">
+            </label>
+            <label class="settings-field">
+              Display name
+              <input name="name" required maxlength="80" placeholder="Camera - Node 12">
+            </label>
+            <label class="settings-field">
+              Monitored node
+              <select name="node_id" required>
+                {% for node in nodes %}
+                <option value="{{ node.id }}">{{ node.name }} ({{ node.id }})</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label class="settings-field">
+              HTTP snapshot URL (optional)
+              <input name="url" type="url" placeholder="http://192.168.1.20/capture">
+            </label>
+          </div>
+          <button class="btn btn-clear" type="submit">Add Camera</button>
+          <div class="settings-status" id="camera-add-status" role="status" aria-live="polite"></div>
+        </form>
+      </section>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -1536,6 +1709,7 @@ HTML_TEMPLATE = """
   socket.on('node_update',    node    => updateNodeCard(node));
   socket.on('nodes_changed', () => window.location.reload());
   socket.on('camera_update',  cam     => updateCameraCard(cam));
+  socket.on('cameras_changed', () => window.location.reload());
   socket.on('devices_update', devices => renderDevices(devices));
 
   // ── NODE CARDS ─────────────────────────────
@@ -1653,8 +1827,8 @@ HTML_TEMPLATE = """
       card.innerHTML = `
         <div class="camera-header">
           <div>
-            <div class="camera-name">${cam.name}</div>
-            <div class="camera-node">Monitoring: ${cam.node_id}</div>
+            <div class="camera-name"></div>
+            <div class="camera-node"></div>
           </div>
           <button class="toggle-cam-btn" onclick="toggleCamera('${cam.id}')">
             ${cam.enabled ? 'Disable' : 'Enable'}
@@ -1685,6 +1859,8 @@ HTML_TEMPLATE = """
           <span style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--muted)" id="cam-error-${cam.id}"></span>
         </div>
       `;
+      card.querySelector('.camera-name').textContent = cam.name;
+      card.querySelector('.camera-node').textContent = `Monitoring: ${cam.node_id}`;
       grid.appendChild(card);
       cameraCards[cam.id] = card;
       none.style.display = 'none';
@@ -1697,7 +1873,9 @@ HTML_TEMPLATE = """
     const seenEl   = document.getElementById(`cam-seen-${cam.id}`);
     const statusEl = document.getElementById(`cam-status-${cam.id}`);
     const errorEl  = document.getElementById(`cam-error-${cam.id}`);
+    const toggleButton = card.querySelector('.toggle-cam-btn');
 
+    if (toggleButton) toggleButton.textContent = cam.enabled ? 'Disable' : 'Enable';
     if (debrisEl) debrisEl.textContent = cam.debris_count ?? '--';
     if (distEl)   distEl.textContent   = cam.closest_debris ? `${cam.closest_debris}` : '--';
     if (seenEl)   seenEl.textContent   = cam.last_seen ?? '--';
@@ -1720,32 +1898,35 @@ HTML_TEMPLATE = """
     socket.emit('toggle_camera', { cam_id: camId });
   }
 
-  document.getElementById('add-node-form').addEventListener('submit', async event => {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const status = document.getElementById('node-add-status');
-    const submit = form.querySelector('button[type="submit"]');
-    const values = new FormData(form);
-    submit.disabled = true;
-    status.textContent = '';
+  function registerSettingsForm(formId, endpoint, fields, statusId) {
+    const form = document.getElementById(formId);
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      const status = document.getElementById(statusId);
+      const submit = form.querySelector('button[type="submit"]');
+      const values = new FormData(form);
+      const payload = Object.fromEntries(fields.map(field => [field, values.get(field)]));
+      submit.disabled = true;
+      status.textContent = '';
 
-    try {
-      const response = await fetch('/api/nodes', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: values.get('id'),
-          name: values.get('name')
-        })
-      });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || 'Could not add node');
-      window.location.reload();
-    } catch (error) {
-      status.textContent = error.message;
-      submit.disabled = false;
-    }
-  });
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Could not save settings');
+        window.location.reload();
+      } catch (error) {
+        status.textContent = error.message;
+        submit.disabled = false;
+      }
+    });
+  }
+
+  registerSettingsForm('add-node-form', '/api/nodes', ['id', 'name'], 'node-add-status');
+  registerSettingsForm('add-camera-form', '/api/cameras', ['id', 'name', 'node_id', 'url'], 'camera-add-status');
 
   // ── DEVICES ────────────────────────────────
   function renderDevices(devices) {
@@ -1812,8 +1993,11 @@ HTML_TEMPLATE = """
     const log   = document.getElementById('log-output');
     const ts    = new Date().toLocaleTimeString('en-US', { hour12: false });
     const entry = document.createElement('div');
+    const timestamp = document.createElement('span');
     entry.className = `log-entry ${type}`;
-    entry.innerHTML = `<span class="ts">[${ts}]</span>${msg}`;
+    timestamp.className = 'ts';
+    timestamp.textContent = `[${ts}]`;
+    entry.append(timestamp, document.createTextNode(msg));
     log.appendChild(entry);
     log.scrollTop = log.scrollHeight;
   }
@@ -1845,11 +2029,9 @@ if __name__ == '__main__':
     scan_thread.start()
 
     # Start camera detection threads
-    for cam in cameras.values():
+    for cam in camera_snapshot():
+        start_camera_worker(cam)
         if cam.enabled:
-            cam_thread = threading.Thread(target=camera_loop, args=(cam,))
-            cam_thread.daemon = True
-            cam_thread.start()
             print(f"[CAM] Started detection for {cam.name}")
 
     print("=" * 50)
@@ -1859,7 +2041,7 @@ if __name__ == '__main__':
     print(f"  ESP32 TCP:  0.0.0.0:{ESP32_SERVER_PORT}")
     print(f"  ESP32-CAM stream: 0.0.0.0:{CAMERA_STREAM_PORT}")
     print(f"  Focal Len:  {FOCAL_LENGTH:.1f}px")
-    print(f"  Cameras:    {len([c for c in cameras.values() if c.enabled])} active")
+    print(f"  Cameras:    {len([c for c in camera_snapshot() if c.enabled])} active")
     print("=" * 50)
 
     socketio.run(app, host='0.0.0.0', port=8080, debug=False, allow_unsafe_werkzeug=True)
