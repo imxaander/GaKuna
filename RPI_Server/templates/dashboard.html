@@ -1451,6 +1451,7 @@
         color,
         depth,
         floor: box.floor,
+        kind: box.kind,
         z: (Math.min(...coords.map(c => c[2])) + Math.max(...coords.map(c => c[2]))) / 2,
         stroke: box.colors.stroke,
         opacity: buildingView.level === 'both' && buildingView.cutaway && box.floor === 2 ? 0.32 : 1
@@ -1541,7 +1542,11 @@
       if (left.floor !== right.floor) return left.floor - right.floor;
       // Secondary sort: by z-coordinate within the same floor
       if (Math.abs(left.z - right.z) > 0.01) return left.z - right.z;
-      // Tertiary sort: by depth (isometric distance)
+      // Tertiary sort: within same z-height, slabs render before other objects
+      const leftIsSlab = left.kind === 'slab' ? 0 : 1;
+      const rightIsSlab = right.kind === 'slab' ? 0 : 1;
+      if (leftIsSlab !== rightIsSlab) return leftIsSlab - rightIsSlab;
+      // Quaternary sort: by depth (isometric distance)
       return left.depth - right.depth;
     });
     faces.forEach(face => {
