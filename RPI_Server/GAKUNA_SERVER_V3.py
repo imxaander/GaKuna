@@ -45,10 +45,67 @@ DEFAULT_NODE_CONFIG = [
     {"id": "node_22", "name": "Node 22 - Floor 2 middle", "ip": "DHCP", "port": 5001},
     {"id": "node_23", "name": "Node 23 - Floor 2 right end", "ip": "DHCP", "port": 5001},
 ]
-LEGACY_DEFAULT_NODE_IDS = {
-    "node_1": ("node_11", "Node 11 - Floor 1 Left", "Node 11 - Floor 1 left end"),
-    "node_2": ("node_12", "Node 12 - Floor 1 Left", "Node 12 - Floor 1 right end"),
+DEFAULT_NODE_CONFIG_BY_ID = {node["id"]: node for node in DEFAULT_NODE_CONFIG}
+LEGACY_NODE_ID_MAP = {
+    "node_1": "node_11",
+    "node_2": "node_12",
+    "node_3": "node_21",
+    "node_4": "node_22",
+    "node_5": "node_23",
 }
+CAMERA_NODE_ASSIGNMENTS = {
+    "cam_1": "node_11",
+    "cam_2": "node_12",
+    "cam_3": "node_21",
+    "cam_4": "node_22",
+    "cam_5": "node_23",
+}
+
+
+def canonical_node_id(node_id):
+    if not isinstance(node_id, str):
+        return node_id
+    return LEGACY_NODE_ID_MAP.get(node_id, node_id)
+
+
+def canonical_camera_node_id(camera_id, node_id):
+    if isinstance(node_id, str) and node_id in LEGACY_NODE_ID_MAP:
+        if isinstance(camera_id, str) and camera_id in CAMERA_NODE_ASSIGNMENTS:
+            return CAMERA_NODE_ASSIGNMENTS[camera_id]
+        return canonical_node_id(node_id)
+    return node_id
+
+
+def migrate_node_registry(database):
+    for old_id, new_id in LEGACY_NODE_ID_MAP.items():
+        old_node = database.execute(
+            "SELECT ip, port FROM node_registry WHERE id = ?",
+            (old_id,),
+        ).fetchone()
+        if not old_node:
+            continue
+
+        canonical = DEFAULT_NODE_CONFIG_BY_ID[new_id]
+        existing_node = database.execute(
+            "SELECT ip FROM node_registry WHERE id = ?",
+            (new_id,),
+        ).fetchone()
+        if existing_node:
+            if existing_node[0] == "DHCP" and old_node[0] != "DHCP":
+                database.execute(
+                    "UPDATE node_registry SET ip = ?, port = ? WHERE id = ?",
+                    (old_node[0], old_node[1], new_id),
+                )
+            database.execute(
+                "UPDATE node_registry SET name = ? WHERE id = ?",
+                (canonical["name"], new_id),
+            )
+            database.execute("DELETE FROM node_registry WHERE id = ?", (old_id,))
+        else:
+            database.execute(
+                "UPDATE node_registry SET id = ?, name = ? WHERE id = ?",
+                (new_id, canonical["name"], old_id),
+            )
 DATABASE_PATH = os.environ.get(
     "GAKUNA_DATABASE_PATH",
     os.environ.get(
@@ -68,20 +125,7 @@ def load_node_configs():
                     port INTEGER NOT NULL
                 )
             """)
-            for old_id, (new_id, old_name, new_name) in LEGACY_DEFAULT_NODE_IDS.items():
-                legacy_node = database.execute(
-                    "SELECT 1 FROM node_registry WHERE id = ? AND name = ?",
-                    (old_id, old_name),
-                ).fetchone()
-                mapped_node = database.execute(
-                    "SELECT 1 FROM node_registry WHERE id = ?",
-                    (new_id,),
-                ).fetchone()
-                if legacy_node and not mapped_node:
-                    database.execute(
-                        "UPDATE node_registry SET id = ?, name = ? WHERE id = ?",
-                        (new_id, new_name, old_id),
-                    )
+            migrate_node_registry(database)
             database.executemany(
                 "INSERT OR IGNORE INTO node_registry (id, name, ip, port) VALUES (?, ?, ?, ?)",
                 [(node["id"], node["name"], node["ip"], node["port"]) for node in DEFAULT_NODE_CONFIG],
@@ -157,6 +201,34 @@ DEFAULT_CAMERA_CONFIG = [
         "node_id":    "node_11",
         "enabled":    True,
     },
+    {
+        "id":         "cam_2",
+        "name":       "Camera - Node 12",
+        "url":        None,
+        "node_id":    "node_12",
+        "enabled":    True,
+    },
+    {
+        "id":         "cam_3",
+        "name":       "Camera - Node 21",
+        "url":        None,
+        "node_id":    "node_21",
+        "enabled":    True,
+    },
+    {
+        "id":         "cam_4",
+        "name":       "Camera - Node 22",
+        "url":        None,
+        "node_id":    "node_22",
+        "enabled":    True,
+    },
+    {
+        "id":         "cam_5",
+        "name":       "Camera - Node 23",
+        "url":        None,
+        "node_id":    "node_23",
+        "enabled":    True,
+    },
 ]
 
 def load_camera_configs():
@@ -184,10 +256,14 @@ def load_camera_configs():
                     for camera in DEFAULT_CAMERA_CONFIG
                 ],
             )
-            database.execute(
-                "UPDATE camera_registry SET node_id = 'node_11' "
-                "WHERE id = 'cam_1' AND name = 'Camera - Node 11' AND node_id = 'node_1'"
-            )
+            for camera_id, node_id in database.execute(
+                "SELECT id, node_id FROM camera_registry"
+            ).fetchall():
+                if node_id in LEGACY_NODE_ID_MAP:
+                    database.execute(
+                        "UPDATE camera_registry SET node_id = ? WHERE id = ?",
+                        (canonical_camera_node_id(camera_id, node_id), camera_id),
+                    )
             database.row_factory = sqlite3.Row
             rows = database.execute(
                 "SELECT id, name, url, node_id, enabled FROM camera_registry ORDER BY rowid"
@@ -392,6 +468,7 @@ def node_snapshot():
 def get_node(node_id):
     if not isinstance(node_id, str):
         return None
+    node_id = canonical_node_id(node_id)
     with nodes_lock:
         return nodes.get(node_id)
 
@@ -1042,7 +1119,7 @@ def api_add_node():
     if not isinstance(data, dict):
         return jsonify({"error": "Expected a JSON object"}), 400
 
-    node_id = data.get('id')
+    node_id = canonical_node_id(data.get('id'))
     name = data.get('name')
     if not valid_registry_id(node_id):
         return jsonify({"error": "Node ID must be 1-32 letters, numbers, underscores, or hyphens"}), 400
@@ -1083,7 +1160,7 @@ def api_add_camera():
 
     camera_id = data.get('id')
     name = data.get('name')
-    node_id = data.get('node_id')
+    node_id = canonical_camera_node_id(camera_id, data.get('node_id'))
     url = data.get('url', '')
     if not valid_registry_id(camera_id):
         return jsonify({"error": "Camera ID must be 1-32 letters, numbers, underscores, or hyphens"}), 400

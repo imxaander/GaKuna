@@ -158,6 +158,99 @@ class DashboardTests(unittest.TestCase):
             finally:
                 server.DATABASE_PATH = original_database_path
 
+    def test_legacy_node_slots_merge_and_camera_bindings_normalize(self):
+        original_database_path = server.DATABASE_PATH
+        with tempfile.TemporaryDirectory(prefix="gakuna-legacy-slots-") as directory:
+            server.DATABASE_PATH = str(Path(directory) / "legacy.db")
+            try:
+                with closing(server.sqlite3.connect(server.DATABASE_PATH)) as database:
+                    with database:
+                        database.execute("""
+                            CREATE TABLE node_registry (
+                                id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                                ip TEXT NOT NULL, port INTEGER NOT NULL
+                            )
+                        """)
+                        database.executemany(
+                            "INSERT INTO node_registry VALUES (?, ?, ?, ?)",
+                            [
+                                ("node_3", "Node 13 - Floor 2", "192.168.1.30", 5030),
+                                ("node_21", "Old Node 21", "DHCP", 5001),
+                                ("node_4", "Node 14 - Floor 2", "192.168.1.40", 5040),
+                                ("node_22", "Old Node 22", "192.168.1.22", 5001),
+                            ],
+                        )
+                        database.execute("""
+                            CREATE TABLE camera_registry (
+                                id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT,
+                                node_id TEXT NOT NULL, enabled INTEGER NOT NULL
+                            )
+                        """)
+                        database.executemany(
+                            "INSERT INTO camera_registry VALUES (?, ?, ?, ?, ?)",
+                            [
+                                ("cam_1", "Cam 1", None, "node_1", 1),
+                                ("cam_2", "Cam 2", None, "node_2", 1),
+                                ("cam_3", "Cam 3", None, "node_1", 1),
+                                ("cam_4", "Cam 4", None, "node_1", 1),
+                            ],
+                        )
+
+                nodes = server.load_node_configs()
+                cameras = server.load_camera_configs()
+                nodes_by_id = {node["id"]: node for node in nodes}
+                cameras_by_id = {camera["id"]: camera for camera in cameras}
+
+                self.assertNotIn("node_3", nodes_by_id)
+                self.assertNotIn("node_4", nodes_by_id)
+                self.assertEqual(nodes_by_id["node_21"]["name"], "Node 21 - Floor 2 left end")
+                self.assertEqual(nodes_by_id["node_21"]["ip"], "192.168.1.30")
+                self.assertEqual(nodes_by_id["node_21"]["port"], 5030)
+                self.assertEqual(nodes_by_id["node_22"]["name"], "Node 22 - Floor 2 middle")
+                self.assertEqual(nodes_by_id["node_22"]["ip"], "192.168.1.22")
+                self.assertIn("node_23", nodes_by_id)
+                self.assertEqual(
+                    {camera_id: camera["node_id"] for camera_id, camera in cameras_by_id.items()},
+                    {
+                        "cam_1": "node_11",
+                        "cam_2": "node_12",
+                        "cam_3": "node_21",
+                        "cam_4": "node_22",
+                        "cam_5": "node_23",
+                    },
+                )
+
+                with closing(server.sqlite3.connect(server.DATABASE_PATH)) as database:
+                    with database:
+                        database.execute(
+                            "UPDATE camera_registry SET node_id = ? WHERE id = ?",
+                            ("node_12", "cam_3"),
+                        )
+                cameras = server.load_camera_configs()
+                self.assertEqual(
+                    {camera["id"]: camera["node_id"] for camera in cameras}["cam_3"],
+                    "node_12",
+                )
+            finally:
+                server.DATABASE_PATH = original_database_path
+
+    def test_legacy_node_ids_resolve_to_canonical_slots(self):
+        for legacy_id, canonical_id in server.LEGACY_NODE_ID_MAP.items():
+            with self.subTest(legacy_id=legacy_id):
+                self.assertIs(server.get_node(legacy_id), server.get_node(canonical_id))
+
+        duplicate = self.client.post(
+            "/api/nodes",
+            json={"id": "node_5", "name": "Legacy fifth node"},
+        )
+        self.assertEqual(duplicate.status_code, 409)
+
+        invalid_camera = self.client.post(
+            "/api/cameras",
+            json={"id": ["invalid"], "name": "Invalid camera", "node_id": "node_1"},
+        )
+        self.assertEqual(invalid_camera.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

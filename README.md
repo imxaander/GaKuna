@@ -15,12 +15,26 @@ python RPI_Server/GAKUNA_SERVER_V3.py
 
 The server stores node and camera registrations and dashboard thresholds in
 `RPI_Server/gakuna_nodes.db`, created automatically on first run. The five map
-nodes (`node_11`, `node_12`, `node_21`, `node_22`, and `node_23`) and `cam_1`
-are seeded on first run. Existing default `node_1`/`node_2` records are migrated
-to `node_11`/`node_12` when their original seeded names are unchanged. Add
-additional devices from the dashboard's **Settings** tab:
+nodes (`node_11`, `node_12`, `node_21`, `node_22`, and `node_23`) and cameras
+`cam_1` through `cam_5` are seeded on first run. Legacy node IDs are accepted
+without changing firmware and resolve to these floor-plan positions:
 
-- A node ID must match `NODE_ID` in its ESP32 firmware.
+| Firmware ID | Dashboard node | Area | Camera |
+| --- | --- | --- | --- |
+| `node_1` | `node_11` | Floor 1, left end | `cam_1` |
+| `node_2` | `node_12` | Floor 1, right end | `cam_2` |
+| `node_3` | `node_21` | Floor 2, left end | `cam_3` |
+| `node_4` | `node_22` | Floor 2, middle | `cam_4` |
+| `node_5` | `node_23` | Floor 2, right end | `cam_5` |
+
+On startup, old registry rows are merged into these canonical nodes; saved
+network settings are retained where possible. Legacy camera-to-node references
+are migrated by camera number, while existing camera assignments already using
+canonical node IDs are left unchanged. Add additional devices from the
+dashboard's **Settings** tab:
+
+- A node ID should match `NODE_ID` in its ESP32 firmware; both the canonical IDs
+  and legacy `node_1` through `node_5` are supported.
 - A camera ID must match `CAMERA_ID` in its ESP32-CAM firmware. Leave its URL
   blank for the TCP frame stream, or enter an HTTP snapshot URL.
 
