@@ -32,10 +32,10 @@ public class DebugAgent : MonoBehaviour
                 continue;
             }
 
-            if (node.leftNeighbor == null && node.rightNeighbor == null) ;  
-                Debug.LogWarning($"Node {node.nodeID} has NO neighbors assigned — agent will always get -1 and loop forever");
+            if (node.leftNeighbor == null && node.rightNeighbor == null)
+                Debug.LogWarning($"Node {node.nodeID} has NO neighbors assigned - agent will always get -1 and loop forever");
         }
 
-        Debug.Log($"Setup OK — {agent.nodes.Length} nodes, {agent.exits.Length} exits");
+        Debug.Log($"Setup OK ï¿½ {agent.nodes.Length} nodes, {agent.exits.Length} exits");
     }
 }

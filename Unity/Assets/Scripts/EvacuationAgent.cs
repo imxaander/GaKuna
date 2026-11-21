@@ -1,5 +1,6 @@
 ﻿using Unity.MLAgents;
 using Unity.MLAgents.Actuators;
+using Unity.MLAgents.Policies;
 using Unity.MLAgents.Sensors;
 using UnityEngine;
 
@@ -9,25 +10,55 @@ public class EvacuationAgent : Agent
     public Transform[] exits;
     public FireSource fireSource;
 
-    // Set these to match your actual Unity scene Y positions
-    public float floor1Y = 1f;    // Y position of floor 1 corridor
-    public float floor2Y = 5f;    // Y position of floor 2 corridor
+    // Actual corridor Y positions in the Unity scene (used for fire spawn)
+    public float floor1Y = -0.1715f;   // Y position of floor 1 corridor
+    public float floor2Y = 4.52f;      // Y position of floor 2 corridor
+
+
+    [Tooltip("Set true for the inference visual demo: keep the scenario stable and " +
+             "do NOT end/reset the episode mid-walk. Also auto-enables when a model " +
+             "is loaded with no training communicator active.")]
+    public bool inferenceVisualMode = false;
 
     private const int SignageOptions = 3;
-    private const int MaxStepsPerEpisode = 50; // Steps before episode ends
+    private const int MaxStepsPerEpisode = 50;
     private int stepCount = 0;
+
+    // Reward accumulator — give full reward at episode end only
+    private float episodeReward = 0f;
+
+    // Tracks whether the current hazard scenario has been set up (inference demo)
+    private bool scenarioInitialized = false;
 
     public override void OnEpisodeBegin()
     {
         stepCount = 0;
+        episodeReward = 0f;
         fireSource.Deactivate();
 
         foreach (var node in nodes)
             node.ResetNode();
-        
-        // Random blockage
-        if (Random.value > 0.7f)
-            nodes[Random.Range(0, nodes.Length)].isBlocked = true;
+
+        // In inference-visual mode, randomize the hazard scenario only once and keep
+        // it stable so the walker can complete a route without the fire/signage resetting
+        // mid-demo. Re-entering Play (or toggling the flag) restarts a fresh scenario.
+        bool inferenceDemo = inferenceVisualMode || IsInferenceDemo();
+        if (inferenceDemo && scenarioInitialized)
+            return;
+
+        // Random blockages — each node has a 30% chance, capped at 2 blocked nodes
+        // to guarantee a viable route usually remains discoverable.
+        const int maxBlocked = 2;
+        int blockedCount = 0;
+        for (int i = 0; i < nodes.Length; i++)
+        {
+            if (blockedCount >= maxBlocked) break;
+            if (Random.value <= 0.3f)
+            {
+                nodes[i].isBlocked = true;
+                blockedCount++;
+            }
+        }
 
         // Random seismic
         if (Random.value > 0.5f)
@@ -48,13 +79,18 @@ public class EvacuationAgent : Agent
         );
         fireSource.Activate(firePos, Random.Range(300f, 800f));
 
-        //Debug.Log($"Episode start — Fire on Floor {(spawnOnFloor2 ? 2 : 1)} at {firePos}");
+        scenarioInitialized = true;
     }
 
-
+    bool IsInferenceDemo()
+    {
+        var bp = GetComponent<BehaviorParameters>();
+        return bp != null && bp.Model != null && !Academy.Instance.IsCommunicatorOn;
+    }
 
     public override void CollectObservations(VectorSensor sensor)
     {
+        // Per-node observations: temp, seismic, blocked, floor, stair, signage, blocked-neighbor
         foreach (var node in nodes)
         {
             sensor.AddObservation(node.temperature / 1000f);
@@ -62,8 +98,27 @@ public class EvacuationAgent : Agent
             sensor.AddObservation(node.isBlocked ? 1f : 0f);
             sensor.AddObservation(node.floor == 2 ? 1f : 0f);
             sensor.AddObservation(node.isStairNode ? 1f : 0f);
+
+            // Connectivity: does this node have left/right neighbors
+            sensor.AddObservation(node.leftNeighbor != null ? 1f : 0f);
+            sensor.AddObservation(node.rightNeighbor != null ? 1f : 0f);
+            sensor.AddObservation(node.isExitNode ? 1f : 0f);
         }
-        // 5 × 5 nodes = 25
+
+        // Global observations
+        // Fire position normalized
+        Vector3 firePos = fireSource.transform.position;
+        sensor.AddObservation(firePos.x / 15f);
+        sensor.AddObservation(firePos.y / 10f);
+
+        // Fire intensity normalized
+        sensor.AddObservation(fireSource.intensity / 1000f);
+
+        // Total blocked count
+        int blockedCount = 0;
+        foreach (var node in nodes)
+            if (node.isBlocked) blockedCount++;
+        sensor.AddObservation((float)blockedCount / nodes.Length);
     }
 
     public override void OnActionReceived(ActionBuffers actions)
@@ -71,22 +126,23 @@ public class EvacuationAgent : Agent
         stepCount++;
 
         // Apply signage from PPO
-        string log = "PPO Actions: ";
         for (int i = 0; i < nodes.Length; i++)
         {
             int action = Mathf.Clamp(actions.DiscreteActions[i], 0, SignageOptions - 1);
             nodes[i].signage = (SignageState)action;
-            log += $"Node{nodes[i].nodeID}={(SignageState)action} ";
         }
-        Debug.Log(log);
 
-        // Give step reward based on current signage quality
-        float reward = EvaluateCurrentSignage();
-        AddReward(reward);
+        // In inference-visual mode, keep the episode open so the walker can follow the
+        // (stable) signage all the way to the exit without hazards/signs resetting.
+        bool inferenceDemo = inferenceVisualMode || IsInferenceDemo();
+        if (inferenceDemo)
+            return;
 
-        // Only end episode after enough steps
+        // End episode — give single evaluation reward
         if (stepCount >= MaxStepsPerEpisode)
         {
+            float finalReward = EvaluateCurrentSignage();
+            AddReward(finalReward);
             EndEpisode();
         }
     }
@@ -104,16 +160,31 @@ public class EvacuationAgent : Agent
         }
     }
 
-    // Renamed from SimulateAgentFollowingSigns — now called per step
+    /// <summary>
+    /// Simulate evacuation from every node following current signage.
+    /// Returns average reward across all start positions.
+    /// </summary>
     float EvaluateCurrentSignage()
     {
         float totalReward = 0f;
+        int scored = 0;
 
         for (int startIdx = 0; startIdx < nodes.Length; startIdx++)
-            totalReward += SimulateFromNode(startIdx);
+        {
+            // Skip starts that are themselves blocked: the signage cannot help evacuees
+            // at an impassable node, so its outcome is out of the agent's control. Including
+            // it would swamp the mean with noise and hide the learnable signal. (Routing INTO
+            // a blocked node from a viable start is still penalized in SimulateFromNode.)
+            if (nodes[startIdx].isBlocked)
+                continue;
 
-        return totalReward / nodes.Length;
+            totalReward += SimulateFromNode(startIdx);
+            scored++;
+        }
+
+        return scored > 0 ? totalReward / scored : 0f;
     }
+
     float SimulateFromNode(int startIdx)
     {
         int currentIdx = startIdx;
@@ -122,7 +193,7 @@ public class EvacuationAgent : Agent
         float totalDanger = 0f;
         bool reachedExit = false;
         bool[] visited = new bool[nodes.Length];
-        int nextIdx = 0;
+
         while (steps < maxSteps)
         {
             if (currentIdx < 0 || currentIdx >= nodes.Length) break;
@@ -130,6 +201,12 @@ public class EvacuationAgent : Agent
 
             visited[currentIdx] = true;
             Nodes current = nodes[currentIdx];
+
+            // Routing into a blocked node from a viable start is a learnable mistake — penalize
+            // moderately (was -8, which dominated the +1..+6 success band and hid any gradient).
+            if (current.isBlocked)
+                return -4f;
+
             totalDanger += current.GetDangerScore();
 
             if (IsNearExit(current.position, 3f) || current.isExitNode)
@@ -138,13 +215,12 @@ public class EvacuationAgent : Agent
                 break;
             }
 
-            nextIdx = GetNextNodeIndex(currentIdx);
+            int nextIdx = GetNextNodeIndex(currentIdx);
 
-            // PENALTY: sign points to null neighbor = dead end
+            // Sign points to null neighbor = dead end (was -5; softened so the scale stays
+            // comparable to the +1..+6 success band and the agent keeps a gradient to explore).
             if (nextIdx == -1)
-            {
-                return -50f; // Heavy penalty for dead end routing
-            }
+                return -3f;
 
             currentIdx = nextIdx;
             steps++;
@@ -152,19 +228,23 @@ public class EvacuationAgent : Agent
 
         if (reachedExit)
         {
-            float speedBonus = Mathf.Max(0, (maxSteps - steps) * 2f); // reduced from 5
-            float safetyBonus = Mathf.Max(0, 100f - totalDanger);      // reduced from 300
-            return 10f + speedBonus + safetyBonus;                      // reduced from 100
+            // Normalize reward: speed bonus [0, 2], safety bonus [0, 3], base 1
+            float speedBonus = Mathf.Max(0f, (maxSteps - steps) * 0.1f);
+            float safetyBonus = Mathf.Max(0f, 3f - totalDanger * 0.005f);
+            return 1f + speedBonus + safetyBonus;
         }
 
-        // Gentler penalties so reward signal has gradient to climb
-        if (nextIdx == -1) return -50f;   // was -500
-        return -15f - (totalDanger * 0.01f); // was -150
+        return -1f - (totalDanger * 0.002f);
     }
 
     int GetNextNodeIndex(int currentIdx)
     {
         Nodes current = nodes[currentIdx];
+        // On a stair node, LEFT or RIGHT leads upstairs/downstairs to the stair neighbor
+        if (current.isStairNode && current.stairNeighbor != null &&
+            current.signage != SignageState.Stop)
+            return System.Array.IndexOf(nodes, current.stairNeighbor);
+
         switch (current.signage)
         {
             case SignageState.Left:

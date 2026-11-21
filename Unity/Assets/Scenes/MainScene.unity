@@ -953,7 +953,7 @@ Transform:
   m_GameObject: {fileID: 167772558}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: -25.47, y: 0.2, z: 12}
+  m_LocalPosition: {x: 13.63, y: 3.84, z: 11.79}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children:
@@ -1355,6 +1355,10 @@ PrefabInstance:
     - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
       propertyPath: nodeID
       value: 12
+      objectReference: {fileID: 0}
+    - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
+      propertyPath: floor
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
       propertyPath: leftNeighbor
@@ -3069,7 +3073,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
       propertyPath: floor
-      value: 1
+      value: 2
       objectReference: {fileID: 0}
     - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
       propertyPath: nodeID
@@ -3851,6 +3855,7 @@ MonoBehaviour:
   fireSource: {fileID: 2143457730}
   floor1Y: 0
   floor2Y: 4
+  inferenceVisualMode: 0
 --- !u!114 &968958937
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -3864,7 +3869,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Unity.ML-Agents::Unity.MLAgents.Policies.BehaviorParameters
   m_BrainParameters:
-    VectorObservationSize: 25
+    VectorObservationSize: 44
     NumStackedVectorObservations: 1
     m_ActionSpec:
       m_NumContinuousActions: 0
@@ -3873,14 +3878,14 @@ MonoBehaviour:
     VectorActionDescriptions: []
     VectorActionSpaceType: 0
     hasUpgradedBrainParametersWithActionSpec: 1
-  m_Model: {fileID: 5022602860645237092, guid: e4ec3a5c3fcb400438116cea6278f6e1, type: 3}
+  m_Model: {fileID: 5022602860645237092, guid: 94eb4cefd8c460d4c896fba946f0951a, type: 3}
   m_InferenceDevice: 0
-  m_BehaviorType: 0
+  m_BehaviorType: 2
   m_BehaviorName: Evacuationer
   TeamId: 0
   m_UseChildSensors: 1
   m_UseChildActuators: 1
-  m_DeterministicInference: 1
+  m_DeterministicInference: 0
   m_ObservableAttributeHandling: 0
 --- !u!4 &968958938
 Transform:
@@ -3925,8 +3930,9 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8c99ff924a1b6b34da64c6fd02ba1d73, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::AgentVisualizer
-  agent: {fileID: 0}
-  exits: []
+  agent: {fileID: 968958936}
+  exits:
+  - {fileID: 167772559}
   moveSpeed: 2
   pauseAtNode: 0.3
   startNodeIndex: 0
@@ -5038,7 +5044,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
       propertyPath: floor
-      value: 1
+      value: 2
       objectReference: {fileID: 0}
     - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
       propertyPath: nodeID
@@ -5051,7 +5057,7 @@ PrefabInstance:
     - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
       propertyPath: rightNeighbor
       value: 
-      objectReference: {fileID: 303419033}
+      objectReference: {fileID: 0}
     m_RemovedComponents: []
     m_RemovedGameObjects: []
     m_AddedGameObjects: []
@@ -6021,7 +6027,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
       propertyPath: floor
-      value: 1
+      value: 2
       objectReference: {fileID: 0}
     - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
       propertyPath: nodeID
@@ -6034,11 +6040,15 @@ PrefabInstance:
     - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
       propertyPath: rightNeighbor
       value: 
-      objectReference: {fileID: 393073096}
+      objectReference: {fileID: 0}
     - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
       propertyPath: stairNeighbor
       value: 
       objectReference: {fileID: 393073096}
+    - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
+      propertyPath: isStairNode
+      value: 1
+      objectReference: {fileID: 0}
     m_RemovedComponents: []
     m_RemovedGameObjects: []
     m_AddedGameObjects: []
@@ -8051,6 +8061,14 @@ PrefabInstance:
     - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
       propertyPath: nodeID
       value: 11
+      objectReference: {fileID: 0}
+    - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
+      propertyPath: floor
+      value: 1
+      objectReference: {fileID: 0}
+    - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
+      propertyPath: isExitNode
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 8963560880756971004, guid: 821c07d3f662a53499ce5c0eae0dc72a, type: 3}
       propertyPath: leftNeighbor

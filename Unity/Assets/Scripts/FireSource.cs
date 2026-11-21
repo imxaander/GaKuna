@@ -6,12 +6,16 @@ public class FireSource : MonoBehaviour
     public float spreadRadius = 5f;
 
     private bool isActive = false;
+    private Nodes[] cachedNodes;
 
     public void Activate(Vector3 spawnPosition, float newIntensity)
     {
         transform.position = spawnPosition;
         intensity = newIntensity;
         isActive = true;
+
+        if (cachedNodes == null)
+            cachedNodes = FindObjectsByType<Nodes>(FindObjectsSortMode.None);
     }
 
     public void Deactivate()
@@ -22,15 +26,15 @@ public class FireSource : MonoBehaviour
     void Update()
     {
         if (!isActive) return;
+        if (cachedNodes == null) return;
 
-        Nodes[] sensors = FindObjectsByType<Nodes>(FindObjectsSortMode.None);
-        foreach (var sensor in sensors)
+        foreach (var node in cachedNodes)
         {
-            float distance = Vector3.Distance(transform.position, sensor.position);
+            float distance = Vector3.Distance(transform.position, node.position);
             if (distance < spreadRadius)
             {
-                float heatAtSensor = intensity / (1f + distance);
-                sensor.temperature = 25f + heatAtSensor;
+                float heatAtNode = intensity / (1f + distance);
+                node.AddHeat(heatAtNode);
             }
         }
     }

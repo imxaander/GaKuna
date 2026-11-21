@@ -106,6 +106,15 @@ public class AgentVisualizer : MonoBehaviour
                 break;
             }
 
+            // Check blocked
+            if (current.isBlocked)
+            {
+                lastResult = $"BLOCKED at Node{current.nodeID}";
+                SetColor(dangerColor);
+                yield return new WaitForSeconds(0.5f);
+                break;
+            }
+
             // Get next node from signage
             int nextIdx = GetNextIdx(currentIdx);
             if (nextIdx == -1)
@@ -154,6 +163,11 @@ public class AgentVisualizer : MonoBehaviour
     int GetNextIdx(int currentIdx)
     {
         Nodes current = agent.nodes[currentIdx];
+        // On a stair node, LEFT or RIGHT leads upstairs/downstairs to the stair neighbor
+        if (current.isStairNode && current.stairNeighbor != null &&
+            current.signage != SignageState.Stop)
+            return System.Array.IndexOf(agent.nodes, current.stairNeighbor);
+
         switch (current.signage)
         {
             case SignageState.Left:

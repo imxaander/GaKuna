@@ -177,14 +177,7 @@
       "dependencies": {},
       "url": "https://packages.unity.com"
     },
-    "com.unity.sentis": {
-      "version": "file:../Library/PackageCache/com.unity.sentis@eef1e5173b44",
-      "depth": 0,
-      "source": "local",
-      "dependencies": {
-        "com.unity.ai.inference": "2.2.1"
-      }
-    },
+    
     "com.unity.shadergraph": {
       "version": "17.3.0",
       "depth": 1,

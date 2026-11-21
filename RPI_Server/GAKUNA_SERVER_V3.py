@@ -1724,7 +1724,8 @@ HTML_TEMPLATE = """
   .overview-stat-value { font-size: 20px; font-weight: 650; margin: 8px 0 4px; overflow-wrap: anywhere; }
   .overview-stat-value.warn { color: var(--warn); }
   .overview-stat-value.danger { color: var(--danger); }
-  .map-card { padding: 16px; margin-bottom: 18px; }
+  .map-card { padding: 16px; }
+  #overview-container.layout-a .map-card { margin-bottom: 18px; }
   .map-header, .selected-node-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }
   .floor-switcher, .media-switcher { display: flex; gap: 8px; flex-wrap: wrap; }
   .floor-switch, .media-switch { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;
@@ -1817,10 +1818,13 @@ HTML_TEMPLATE = """
   .selected-node-card { grid-column: 1; }
   .overview-other-nodes { grid-column: 1; display: none; }
 
-  /* LAYOUT B: Side-by-side with other nodes */
-  #overview-container.layout-b .map-card { grid-column: 1; grid-row: 1 / 3; }
+  /* LAYOUT B: Compact side-by-side (3D model left, selected node info right) */
+  #overview-container.layout-b .map-card { grid-column: 1; grid-row: 1; overflow: hidden; display: flex; flex-direction: column; }
   #overview-container.layout-b .selected-node-card { grid-column: 2; grid-row: 1; }
-  #overview-container.layout-b .overview-other-nodes { grid-column: 2; grid-row: 2; display: grid; }
+  #overview-container.layout-b .overview-other-nodes { display: none; }
+  
+  #overview-container.layout-b .map-card .building-model-viewport { max-height: 500px; }
+  #overview-container.layout-b .map-card .model-node-list { display: none; }
 
   .overview-other-nodes { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; padding: 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; }
   .overview-other-nodes-title { grid-column: 1 / -1; font-size: 12px; font-weight: 600; color: var(--text); letter-spacing: 0.5px; margin-bottom: 2px; }
@@ -1927,100 +1931,99 @@ HTML_TEMPLATE = """
       </section>
     </div>
 
-    <section class="map-card">
-      <div class="map-header">
-        <div>
-          <h2>Interactive 3D building model</h2>
-          <p class="selected-node-subtitle">Select a node in the model or list to inspect its live details.</p>
-        </div>
-        <div style="display: flex; align-items: center; gap: 20px;">
-          <div class="layout-toggle">
-            <span>Layout:</span>
-            <button type="button" class="layout-toggle-btn active" data-layout="a" onclick="setOverviewLayout('a', this)">Classic</button>
-            <button type="button" class="layout-toggle-btn" data-layout="b" onclick="setOverviewLayout('b', this)">Compact</button>
-          </div>
-          <div class="model-level-switcher" role="group" aria-label="Visible building floors">
-            <button type="button" class="model-level-btn active" aria-pressed="true" onclick="setBuildingLevel('both', this)">Both floors</button>
-            <button type="button" class="model-level-btn" aria-pressed="false" onclick="setBuildingLevel('1', this)">Floor 1</button>
-            <button type="button" class="model-level-btn" aria-pressed="false" onclick="setBuildingLevel('2', this)">Floor 2</button>
-          </div>
-        </div>
-      </div>
-      <div class="model-tools">
-        <button type="button" class="model-tool-btn" onclick="resetBuildingView()">Reset view</button>
-        <button type="button" class="model-tool-btn" aria-label="Zoom in" onclick="zoomBuildingModel(1.2)">+</button>
-        <button type="button" class="model-tool-btn" aria-label="Zoom out" onclick="zoomBuildingModel(0.83)">−</button>
-        <label class="model-explode-toggle">
-          <input type="checkbox" id="building-model-explode">
-          Separate floors
-        </label>
-        <label class="model-explode-toggle">
-          <input type="checkbox" id="building-model-cutaway" checked>
-          Cutaway upper floor
-        </label>
-        <label class="model-explode-toggle">
-          <input type="checkbox" id="building-model-path" checked>
-          Show selected path
-        </label>
-      </div>
-      <p class="model-path-status" id="building-path-status" role="status" aria-live="polite">Select a node to generate its schematic path to the Floor 1 exit.</p>
-      <div class="building-model-viewport">
-        <canvas id="building-model-canvas" aria-label="Interactive isometric 3D schematic of both building floors">
-          Interactive building model. Use the node list below to select a node.
-        </canvas>
-        <div class="building-model-hint">Drag to orbit · scroll to zoom · Shift+drag to pan · click a node for details</div>
-      </div>
-      <div class="model-node-list" aria-label="Select a node">
-        {% for marker in floor_map_nodes %}
-        <button type="button" class="model-node-pick" data-model-node-id="{{ marker.id }}">
-          <span class="model-node-dot" aria-hidden="true"></span>
-          <span class="model-node-label">Node {{ marker.label }}</span>
-          <span class="model-node-state">Loading</span>
-          <span class="model-node-area">{{ marker.area }}</span>
-        </button>
-        {% endfor %}
-      </div>
-      <p class="map-note">The path is a prototype visualization on the schematic hallway/stair graph, not validated evacuation guidance. Reported blocks are marked unknown; routes are not automatically rerouted.</p>
-      <details class="map-2d-details">
-        <summary>View original 2D floor plans</summary>
-        <div class="map-2d-content">
-          <div class="floor-switcher" role="tablist" aria-label="Select 2D floor plan">
-            <button type="button" class="floor-switch active" data-floor="1" onclick="selectFloor(1, this)">Floor 1 · Ground</button>
-            <button type="button" class="floor-switch" data-floor="2" onclick="selectFloor(2, this)">Floor 2</button>
-          </div>
-          <div class="floor-plan active" id="floor-plan-1">
-            <div class="map-stage">
-              <img class="map-image" src="/static/maps/floor-1.png" alt="Floor 1 ground floor schematic for CDM Building 2">
-              {% for marker in floor_map_nodes if marker.floor == 1 %}
-              <button type="button" class="map-node-marker offline {% if marker.edge %}edge-{{ marker.edge }}{% endif %}" data-node-id="{{ marker.id }}"
-                      style="left:{{ marker.left }}%;top:{{ marker.top }}%"
-                      aria-label="Select Node {{ marker.label }}, {{ marker.area }}">
-                <span class="map-node-number">Node {{ marker.label }}</span>
-                <span class="map-node-state">Loading</span>
-              </button>
-              {% endfor %}
-            </div>
-            <p class="map-note">Schematic, not to scale. Dashed node links are not validated route recommendations.</p>
-          </div>
-          <div class="floor-plan" id="floor-plan-2">
-            <div class="map-stage">
-              <img class="map-image" src="/static/maps/floor-2.png" alt="Floor 2 schematic for CDM Building 2">
-              {% for marker in floor_map_nodes if marker.floor == 2 %}
-              <button type="button" class="map-node-marker offline {% if marker.edge %}edge-{{ marker.edge }}{% endif %}" data-node-id="{{ marker.id }}"
-                      style="left:{{ marker.left }}%;top:{{ marker.top }}%"
-                      aria-label="Select Node {{ marker.label }}, {{ marker.area }}">
-                <span class="map-node-number">Node {{ marker.label }}</span>
-                <span class="map-node-state">Loading</span>
-              </button>
-              {% endfor %}
-            </div>
-            <p class="map-note">Schematic, not to scale. Dashed node links are not validated route recommendations.</p>
-          </div>
-        </div>
-      </details>
-    </section>
-
     <div id="overview-container" class="layout-a">
+      <section class="map-card">
+        <div class="map-header">
+          <div>
+            <h2>Interactive 3D building model</h2>
+            <p class="selected-node-subtitle">Select a node in the model or list to inspect its live details.</p>
+          </div>
+          <div style="display: flex; align-items: center; gap: 20px;">
+            <div class="layout-toggle">
+              <span>Layout:</span>
+              <button type="button" class="layout-toggle-btn active" data-layout="a" onclick="setOverviewLayout('a', this)">Classic</button>
+              <button type="button" class="layout-toggle-btn" data-layout="b" onclick="setOverviewLayout('b', this)">Compact</button>
+            </div>
+            <div class="model-level-switcher" role="group" aria-label="Visible building floors">
+              <button type="button" class="model-level-btn active" aria-pressed="true" onclick="setBuildingLevel('both', this)">Both floors</button>
+              <button type="button" class="model-level-btn" aria-pressed="false" onclick="setBuildingLevel('1', this)">Floor 1</button>
+              <button type="button" class="model-level-btn" aria-pressed="false" onclick="setBuildingLevel('2', this)">Floor 2</button>
+            </div>
+          </div>
+        </div>
+        <div class="model-tools">
+          <button type="button" class="model-tool-btn" onclick="resetBuildingView()">Reset view</button>
+          <button type="button" class="model-tool-btn" aria-label="Zoom in" onclick="zoomBuildingModel(1.2)">+</button>
+          <button type="button" class="model-tool-btn" aria-label="Zoom out" onclick="zoomBuildingModel(0.83)">−</button>
+          <label class="model-explode-toggle">
+            <input type="checkbox" id="building-model-explode">
+            Separate floors
+          </label>
+          <label class="model-explode-toggle">
+            <input type="checkbox" id="building-model-cutaway" checked>
+            Cutaway upper floor
+          </label>
+          <label class="model-explode-toggle">
+            <input type="checkbox" id="building-model-path" checked>
+            Show selected path
+          </label>
+        </div>
+        <p class="model-path-status" id="building-path-status" role="status" aria-live="polite">Select a node to generate its schematic path to the Floor 1 exit.</p>
+        <div class="building-model-viewport">
+          <canvas id="building-model-canvas" aria-label="Interactive isometric 3D schematic of both building floors">
+            Interactive building model. Use the node list below to select a node.
+          </canvas>
+          <div class="building-model-hint">Drag to orbit · scroll to zoom · Shift+drag to pan · click a node for details</div>
+        </div>
+        <div class="model-node-list" aria-label="Select a node">
+          {% for marker in floor_map_nodes %}
+          <button type="button" class="model-node-pick" data-model-node-id="{{ marker.id }}">
+            <span class="model-node-dot" aria-hidden="true"></span>
+            <span class="model-node-label">Node {{ marker.label }}</span>
+            <span class="model-node-state">Loading</span>
+            <span class="model-node-area">{{ marker.area }}</span>
+          </button>
+          {% endfor %}
+        </div>
+        <p class="map-note">The path is a prototype visualization on the schematic hallway/stair graph, not validated evacuation guidance. Reported blocks are marked unknown; routes are not automatically rerouted.</p>
+        <details class="map-2d-details">
+          <summary>View original 2D floor plans</summary>
+          <div class="map-2d-content">
+            <div class="floor-switcher" role="tablist" aria-label="Select 2D floor plan">
+              <button type="button" class="floor-switch active" data-floor="1" onclick="selectFloor(1, this)">Floor 1 · Ground</button>
+              <button type="button" class="floor-switch" data-floor="2" onclick="selectFloor(2, this)">Floor 2</button>
+            </div>
+            <div class="floor-plan active" id="floor-plan-1">
+              <div class="map-stage">
+                <img class="map-image" src="/static/maps/floor-1.png" alt="Floor 1 ground floor schematic for CDM Building 2">
+                {% for marker in floor_map_nodes if marker.floor == 1 %}
+                <button type="button" class="map-node-marker offline {% if marker.edge %}edge-{{ marker.edge }}{% endif %}" data-node-id="{{ marker.id }}"
+                        style="left:{{ marker.left }}%;top:{{ marker.top }}%"
+                        aria-label="Select Node {{ marker.label }}, {{ marker.area }}">
+                  <span class="map-node-number">Node {{ marker.label }}</span>
+                  <span class="map-node-state">Loading</span>
+                </button>
+                {% endfor %}
+              </div>
+              <p class="map-note">Schematic, not to scale. Dashed node links are not validated route recommendations.</p>
+            </div>
+            <div class="floor-plan" id="floor-plan-2">
+              <div class="map-stage">
+                <img class="map-image" src="/static/maps/floor-2.png" alt="Floor 2 schematic for CDM Building 2">
+                {% for marker in floor_map_nodes if marker.floor == 2 %}
+                <button type="button" class="map-node-marker offline {% if marker.edge %}edge-{{ marker.edge }}{% endif %}" data-node-id="{{ marker.id }}"
+                        style="left:{{ marker.left }}%;top:{{ marker.top }}%"
+                        aria-label="Select Node {{ marker.label }}, {{ marker.area }}">
+                  <span class="map-node-number">Node {{ marker.label }}</span>
+                  <span class="map-node-state">Loading</span>
+                </button>
+                {% endfor %}
+              </div>
+              <p class="map-note">Schematic, not to scale. Dashed node links are not validated route recommendations.</p>
+            </div>
+          </div>
+        </details>
+      </section>
       <section class="selected-node-card" aria-live="polite">
         <div class="selected-node-heading">
           <div>
@@ -3363,7 +3366,6 @@ HTML_TEMPLATE = """
     document.querySelectorAll('.layout-toggle-btn').forEach(btn => {
       btn.classList.toggle('active', btn === button);
     });
-    if (layout === 'b') renderNodePreviews();
   }
 
   function renderNodePreviews() {
