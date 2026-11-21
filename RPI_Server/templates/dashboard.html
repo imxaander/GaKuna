@@ -1450,6 +1450,8 @@
         points: projected,
         color,
         depth,
+        floor: box.floor,
+        z: (Math.min(...coords.map(c => c[2])) + Math.max(...coords.map(c => c[2]))) / 2,
         stroke: box.colors.stroke,
         opacity: buildingView.level === 'both' && buildingView.cutaway && box.floor === 2 ? 0.32 : 1
       };
@@ -1534,7 +1536,14 @@
     const labels = [];
     floors.forEach(floor => createBuildingLevel(floor, boxes, labels));
     const faces = boxes.flatMap(box => buildingBoxFaces(box, layout));
-    faces.sort((left, right) => left.depth - right.depth);
+    faces.sort((left, right) => {
+      // Primary sort: by floor (lower floor first)
+      if (left.floor !== right.floor) return left.floor - right.floor;
+      // Secondary sort: by z-coordinate within the same floor
+      if (Math.abs(left.z - right.z) > 0.01) return left.z - right.z;
+      // Tertiary sort: by depth (isometric distance)
+      return left.depth - right.depth;
+    });
     faces.forEach(face => {
       context.beginPath();
       context.moveTo(face.points[0].x, face.points[0].y);
