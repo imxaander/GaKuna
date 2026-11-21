@@ -1653,6 +1653,37 @@ HTML_TEMPLATE = """
   .floor-switch, .media-switch { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;
                                   color: var(--muted); background: var(--surface2); cursor: pointer; }
   .floor-switch.active, .media-switch.active { border-color: var(--accent); color: var(--text); }
+  .model-level-switcher, .model-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .model-level-btn, .model-tool-btn { border: 1px solid var(--border); border-radius: 8px; padding: 8px 11px;
+                                      color: var(--muted); background: var(--surface2); cursor: pointer; }
+  .model-level-btn.active, .model-tool-btn:hover { border-color: var(--accent); color: var(--text); }
+  .model-explode-toggle { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; }
+  .model-explode-toggle input { accent-color: var(--accent); }
+  .model-path-status { margin: 8px 0; color: var(--muted); font-size: 11px; }
+  .building-model-viewport { position: relative; overflow: hidden; border: 1px solid var(--border);
+                             border-radius: 10px; background: #0c121a; }
+  #building-model-canvas { display: block; width: 100%; height: 520px; touch-action: none; cursor: grab; }
+  #building-model-canvas.dragging { cursor: grabbing; }
+  .building-model-hint { position: absolute; left: 12px; bottom: 10px; padding: 6px 9px;
+                         border: 1px solid rgba(139,149,165,0.2); border-radius: 7px;
+                         background: rgba(14,17,22,0.88); color: var(--muted); font-size: 10px; pointer-events: none; }
+  .model-node-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 8px; margin-top: 12px; }
+  .model-node-pick { display: grid; grid-template-columns: 9px 1fr auto; align-items: center; gap: 7px;
+                     padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px;
+                     background: var(--surface2); color: var(--text); text-align: left; cursor: pointer; }
+  .model-node-pick:hover, .model-node-pick.selected { border-color: var(--accent); }
+  .model-node-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .model-node-pick.online .model-node-dot { background: var(--success); }
+  .model-node-pick.stale .model-node-dot { background: var(--warn); }
+  .model-node-pick.blocked .model-node-dot { background: var(--danger); }
+  .model-node-label { font-size: 11px; font-weight: 600; }
+  .model-node-area, .model-node-state { color: var(--muted); font-size: 9px; }
+  .model-node-area { grid-column: 2 / 4; }
+  .model-node-state { justify-self: end; }
+  .map-2d-details { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; }
+  .map-2d-details summary { color: var(--muted); font-size: 12px; cursor: pointer; }
+  .map-2d-content { padding-top: 12px; }
+  .map-2d-content .floor-switcher { margin-bottom: 10px; }
   .floor-plan { display: none; }
   .floor-plan.active { display: block; }
   .map-stage { position: relative; overflow: hidden; border-radius: 8px; background: #fff; line-height: 0; }
@@ -1698,6 +1729,7 @@ HTML_TEMPLATE = """
     .overview-summary { grid-template-columns: 1fr; }
     .overview-data-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .map-card { padding: 10px; }
+    #building-model-canvas { height: 400px; }
     .map-node-marker { min-width: 54px; padding: 4px 5px; }
     .map-node-state { font-size: 8px; }
     .map-header, .selected-node-heading { align-items: flex-start; flex-direction: column; }
@@ -1778,42 +1810,87 @@ HTML_TEMPLATE = """
     <section class="map-card">
       <div class="map-header">
         <div>
-          <h2>Building map</h2>
-          <p class="selected-node-subtitle">Select a node marker to inspect its live details.</p>
+          <h2>Interactive 3D building model</h2>
+          <p class="selected-node-subtitle">Select a node in the model or list to inspect its live details.</p>
         </div>
-        <div class="floor-switcher" role="tablist" aria-label="Select floor">
-          <button type="button" class="floor-switch active" data-floor="1" onclick="selectFloor(1, this)">Floor 1 · Ground</button>
-          <button type="button" class="floor-switch" data-floor="2" onclick="selectFloor(2, this)">Floor 2</button>
+        <div class="model-level-switcher" role="group" aria-label="Visible building floors">
+          <button type="button" class="model-level-btn active" aria-pressed="true" onclick="setBuildingLevel('both', this)">Both floors</button>
+          <button type="button" class="model-level-btn" aria-pressed="false" onclick="setBuildingLevel('1', this)">Floor 1</button>
+          <button type="button" class="model-level-btn" aria-pressed="false" onclick="setBuildingLevel('2', this)">Floor 2</button>
         </div>
       </div>
-      <div class="floor-plan active" id="floor-plan-1">
-        <div class="map-stage">
-          <img class="map-image" src="/static/maps/floor-1.png" alt="Floor 1 ground floor schematic for CDM Building 2">
-          {% for marker in floor_map_nodes if marker.floor == 1 %}
-          <button type="button" class="map-node-marker offline {% if marker.edge %}edge-{{ marker.edge }}{% endif %}" data-node-id="{{ marker.id }}"
-                  style="left:{{ marker.left }}%;top:{{ marker.top }}%"
-                  aria-label="Select Node {{ marker.label }}, {{ marker.area }}">
-            <span class="map-node-number">Node {{ marker.label }}</span>
-            <span class="map-node-state">Loading</span>
-          </button>
-          {% endfor %}
-        </div>
-        <p class="map-note">Schematic, not to scale. The displayed node links are not validated route recommendations.</p>
+      <div class="model-tools">
+        <button type="button" class="model-tool-btn" onclick="resetBuildingView()">Reset view</button>
+        <button type="button" class="model-tool-btn" aria-label="Zoom in" onclick="zoomBuildingModel(1.2)">+</button>
+        <button type="button" class="model-tool-btn" aria-label="Zoom out" onclick="zoomBuildingModel(0.83)">−</button>
+        <label class="model-explode-toggle">
+          <input type="checkbox" id="building-model-explode">
+          Separate floors
+        </label>
+        <label class="model-explode-toggle">
+          <input type="checkbox" id="building-model-cutaway" checked>
+          Cutaway upper floor
+        </label>
+        <label class="model-explode-toggle">
+          <input type="checkbox" id="building-model-path" checked>
+          Show selected path
+        </label>
       </div>
-      <div class="floor-plan" id="floor-plan-2">
-        <div class="map-stage">
-          <img class="map-image" src="/static/maps/floor-2.png" alt="Floor 2 schematic for CDM Building 2">
-          {% for marker in floor_map_nodes if marker.floor == 2 %}
-          <button type="button" class="map-node-marker offline {% if marker.edge %}edge-{{ marker.edge }}{% endif %}" data-node-id="{{ marker.id }}"
-                  style="left:{{ marker.left }}%;top:{{ marker.top }}%"
-                  aria-label="Select Node {{ marker.label }}, {{ marker.area }}">
-            <span class="map-node-number">Node {{ marker.label }}</span>
-            <span class="map-node-state">Loading</span>
-          </button>
-          {% endfor %}
-        </div>
-        <p class="map-note">Schematic, not to scale. The displayed node links are not validated route recommendations.</p>
+      <p class="model-path-status" id="building-path-status" role="status" aria-live="polite">Select a node to generate its schematic path to the Floor 1 exit.</p>
+      <div class="building-model-viewport">
+        <canvas id="building-model-canvas" aria-label="Interactive isometric 3D schematic of both building floors">
+          Interactive building model. Use the node list below to select a node.
+        </canvas>
+        <div class="building-model-hint">Drag to orbit · scroll to zoom · Shift+drag to pan · click a node for details</div>
       </div>
+      <div class="model-node-list" aria-label="Select a node">
+        {% for marker in floor_map_nodes %}
+        <button type="button" class="model-node-pick" data-model-node-id="{{ marker.id }}">
+          <span class="model-node-dot" aria-hidden="true"></span>
+          <span class="model-node-label">Node {{ marker.label }}</span>
+          <span class="model-node-state">Loading</span>
+          <span class="model-node-area">{{ marker.area }}</span>
+        </button>
+        {% endfor %}
+      </div>
+      <p class="map-note">The path is a prototype visualization on the schematic hallway/stair graph, not validated evacuation guidance. Reported blocks are marked unknown; routes are not automatically rerouted.</p>
+      <details class="map-2d-details">
+        <summary>View original 2D floor plans</summary>
+        <div class="map-2d-content">
+          <div class="floor-switcher" role="tablist" aria-label="Select 2D floor plan">
+            <button type="button" class="floor-switch active" data-floor="1" onclick="selectFloor(1, this)">Floor 1 · Ground</button>
+            <button type="button" class="floor-switch" data-floor="2" onclick="selectFloor(2, this)">Floor 2</button>
+          </div>
+          <div class="floor-plan active" id="floor-plan-1">
+            <div class="map-stage">
+              <img class="map-image" src="/static/maps/floor-1.png" alt="Floor 1 ground floor schematic for CDM Building 2">
+              {% for marker in floor_map_nodes if marker.floor == 1 %}
+              <button type="button" class="map-node-marker offline {% if marker.edge %}edge-{{ marker.edge }}{% endif %}" data-node-id="{{ marker.id }}"
+                      style="left:{{ marker.left }}%;top:{{ marker.top }}%"
+                      aria-label="Select Node {{ marker.label }}, {{ marker.area }}">
+                <span class="map-node-number">Node {{ marker.label }}</span>
+                <span class="map-node-state">Loading</span>
+              </button>
+              {% endfor %}
+            </div>
+            <p class="map-note">Schematic, not to scale. Dashed node links are not validated route recommendations.</p>
+          </div>
+          <div class="floor-plan" id="floor-plan-2">
+            <div class="map-stage">
+              <img class="map-image" src="/static/maps/floor-2.png" alt="Floor 2 schematic for CDM Building 2">
+              {% for marker in floor_map_nodes if marker.floor == 2 %}
+              <button type="button" class="map-node-marker offline {% if marker.edge %}edge-{{ marker.edge }}{% endif %}" data-node-id="{{ marker.id }}"
+                      style="left:{{ marker.left }}%;top:{{ marker.top }}%"
+                      aria-label="Select Node {{ marker.label }}, {{ marker.area }}">
+                <span class="map-node-number">Node {{ marker.label }}</span>
+                <span class="map-node-state">Loading</span>
+              </button>
+              {% endfor %}
+            </div>
+            <p class="map-note">Schematic, not to scale. Dashed node links are not validated route recommendations.</p>
+          </div>
+        </div>
+      </details>
     </section>
 
     <section class="selected-node-card" aria-live="polite">
@@ -2082,6 +2159,52 @@ HTML_TEMPLATE = """
   const overviewCameras = [];
   let selectedNodeId = 'node_11';
   let selectedMedia = 'thermal';
+  const BUILDING_NODE_POSITIONS = {
+    node_11: { floor: 1, x: 0.5, y: 5.1 },
+    node_12: { floor: 1, x: 11.5, y: 5.1 },
+    node_21: { floor: 2, x: 0.5, y: 5.1 },
+    node_22: { floor: 2, x: 6, y: 5.1 },
+    node_23: { floor: 2, x: 11.5, y: 5.1 }
+  };
+  const BUILDING_WIDTH = 12;
+  const BUILDING_DEPTH = 6.1;
+  const buildingView = {
+    level: 'both', yaw: -0.72, elevation: 0.62, zoom: 1, panX: 0, panY: 0,
+    exploded: false, cutaway: true, showPath: true
+  };
+  const BUILDING_ROUTE_POINTS = {
+    node_11: { floor: 1, x: 0.5, y: 5.1, nodeId: 'node_11' },
+    node_12: { floor: 1, x: 11.5, y: 5.1, nodeId: 'node_12' },
+    node_21: { floor: 2, x: 0.5, y: 5.1, nodeId: 'node_21' },
+    node_22: { floor: 2, x: 6, y: 5.1, nodeId: 'node_22' },
+    node_23: { floor: 2, x: 11.5, y: 5.1, nodeId: 'node_23' },
+    floor1_hall_mid: { floor: 1, x: 6, y: 5.1 },
+    floor1_exit: { floor: 1, x: 6, y: 6.72 },
+    floor2_left_stairs: { floor: 2, x: 0.62, y: 1.75 },
+    floor1_left_stairs: { floor: 1, x: 0.62, y: 1.75 },
+    floor2_mid_stairs: { floor: 2, x: 6, y: 0.82 },
+    floor1_mid_stairs: { floor: 1, x: 6, y: 0.82 },
+    floor2_right_stairs: { floor: 2, x: 11.38, y: 1.75 },
+    floor1_right_stairs: { floor: 1, x: 11.38, y: 1.75 }
+  };
+  const BUILDING_ROUTE_EDGES = [
+    { from: 'node_11', to: 'floor1_hall_mid', kind: 'hallway' },
+    { from: 'node_12', to: 'floor1_hall_mid', kind: 'hallway' },
+    { from: 'floor1_hall_mid', to: 'floor1_exit', kind: 'hallway' },
+    { from: 'node_21', to: 'node_22', kind: 'hallway' },
+    { from: 'node_22', to: 'node_23', kind: 'hallway' },
+    { from: 'node_21', to: 'floor2_left_stairs', kind: 'hallway' },
+    { from: 'node_22', to: 'floor2_mid_stairs', kind: 'hallway' },
+    { from: 'node_23', to: 'floor2_right_stairs', kind: 'hallway' },
+    { from: 'floor2_left_stairs', to: 'floor1_left_stairs', kind: 'stairs' },
+    { from: 'floor2_mid_stairs', to: 'floor1_mid_stairs', kind: 'stairs' },
+    { from: 'floor2_right_stairs', to: 'floor1_right_stairs', kind: 'stairs' },
+    { from: 'floor1_left_stairs', to: 'node_11', kind: 'hallway' },
+    { from: 'floor1_mid_stairs', to: 'floor1_hall_mid', kind: 'hallway' },
+    { from: 'floor1_right_stairs', to: 'node_12', kind: 'hallway' }
+  ];
+  let buildingNodeHits = [];
+  let buildingDrag = null;
 
   // ── TABS ───────────────────────────────────
   function switchTab(name, btn) {
@@ -2089,6 +2212,7 @@ HTML_TEMPLATE = """
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
     document.getElementById('tab-' + name).classList.add('active');
     btn.classList.add('active');
+    if (name === 'overview') window.requestAnimationFrame(renderBuildingModel);
   }
 
   function selectFloor(floor, button) {
@@ -2098,10 +2222,638 @@ HTML_TEMPLATE = """
     document.getElementById(`floor-plan-${floor}`).classList.add('active');
   }
 
+  function setBuildingLevel(level, button) {
+    buildingView.level = level;
+    document.querySelectorAll('.model-level-btn').forEach(item => {
+      item.classList.toggle('active', item === button);
+      item.setAttribute('aria-pressed', item === button ? 'true' : 'false');
+    });
+    renderBuildingModel();
+  }
+
+  function resetBuildingView() {
+    buildingView.yaw = -0.72;
+    buildingView.elevation = 0.62;
+    buildingView.zoom = 1;
+    buildingView.panX = 0;
+    buildingView.panY = 0;
+    renderBuildingModel();
+  }
+
+  function zoomBuildingModel(factor) {
+    buildingView.zoom = Math.max(0.65, Math.min(2.5, buildingView.zoom * factor));
+    renderBuildingModel();
+  }
+
+  function initializeBuildingModel() {
+    const canvas = document.getElementById('building-model-canvas');
+    if (!canvas) return;
+
+    canvas.addEventListener('pointerdown', event => {
+      if (event.button !== 0 && event.button !== 1 && event.button !== 2) return;
+      buildingDrag = {
+        pointerId: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        moved: false,
+        pan: event.shiftKey || event.button !== 0
+      };
+      canvas.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+    canvas.addEventListener('pointermove', event => {
+      if (!buildingDrag || buildingDrag.pointerId !== event.pointerId) {
+        const hit = nearestBuildingNode(event.offsetX, event.offsetY);
+        canvas.style.cursor = hit ? 'pointer' : 'grab';
+        return;
+      }
+      const dx = event.clientX - buildingDrag.x;
+      const dy = event.clientY - buildingDrag.y;
+      if (Math.abs(dx) + Math.abs(dy) > 2) buildingDrag.moved = true;
+      if (buildingDrag.pan) {
+        buildingView.panX += dx;
+        buildingView.panY += dy;
+      } else {
+        buildingView.yaw += dx * 0.008;
+        buildingView.elevation = Math.max(0.2, Math.min(1.05, buildingView.elevation - dy * 0.006));
+      }
+      buildingDrag.x = event.clientX;
+      buildingDrag.y = event.clientY;
+      canvas.classList.add('dragging');
+      renderBuildingModel();
+    });
+    canvas.addEventListener('pointerup', event => {
+      if (!buildingDrag || buildingDrag.pointerId !== event.pointerId) return;
+      const moved = buildingDrag.moved;
+      buildingDrag = null;
+      canvas.classList.remove('dragging');
+      if (!moved) {
+        const bounds = canvas.getBoundingClientRect();
+        const hit = nearestBuildingNode(event.clientX - bounds.left, event.clientY - bounds.top);
+        if (hit) selectOverviewNode(hit);
+      }
+    });
+    canvas.addEventListener('pointercancel', () => {
+      buildingDrag = null;
+      canvas.classList.remove('dragging');
+    });
+    canvas.addEventListener('wheel', event => {
+      event.preventDefault();
+      buildingView.zoom = Math.max(0.65, Math.min(2.5, buildingView.zoom * Math.exp(-event.deltaY * 0.001)));
+      renderBuildingModel();
+    }, { passive: false });
+    canvas.addEventListener('contextmenu', event => event.preventDefault());
+    document.querySelectorAll('.model-node-pick').forEach(button => {
+      button.addEventListener('click', () => selectOverviewNode(button.dataset.modelNodeId));
+    });
+    document.getElementById('building-model-explode').addEventListener('change', event => {
+      buildingView.exploded = event.target.checked;
+      renderBuildingModel();
+    });
+    document.getElementById('building-model-cutaway').addEventListener('change', event => {
+      buildingView.cutaway = event.target.checked;
+      renderBuildingModel();
+    });
+    document.getElementById('building-model-path').addEventListener('change', event => {
+      buildingView.showPath = event.target.checked;
+      renderBuildingModel();
+    });
+    window.addEventListener('resize', renderBuildingModel);
+    renderBuildingModel();
+  }
+
+  function nearestBuildingNode(x, y) {
+    let nearest = null;
+    let nearestDistance = 25;
+    buildingNodeHits.forEach(hit => {
+      const distance = Math.hypot(hit.x - x, hit.y - y);
+      if (distance < nearestDistance) {
+        nearest = hit.id;
+        nearestDistance = distance;
+      }
+    });
+    return nearest;
+  }
+
+  function visibleBuildingFloors() {
+    return buildingView.level === 'both' ? [1, 2] : [Number(buildingView.level)];
+  }
+
+  function shortestBuildingRoute(startId) {
+    const pointIds = Object.keys(BUILDING_ROUTE_POINTS);
+    const distance = {};
+    const previous = {};
+    const previousEdge = {};
+    const unvisited = new Set(pointIds);
+    pointIds.forEach(id => { distance[id] = Infinity; });
+    distance[startId] = 0;
+
+    while (unvisited.size) {
+      let current = null;
+      unvisited.forEach(id => {
+        if (current === null || distance[id] < distance[current]) current = id;
+      });
+      if (current === null || !Number.isFinite(distance[current])) break;
+      unvisited.delete(current);
+      if (current === 'floor1_exit') break;
+
+      BUILDING_ROUTE_EDGES.forEach(edge => {
+        const next = edge.from === current ? edge.to :
+          edge.to === current ? edge.from : null;
+        if (!next || !unvisited.has(next)) return;
+        const fromPoint = BUILDING_ROUTE_POINTS[current];
+        const toPoint = BUILDING_ROUTE_POINTS[next];
+        const fromHeight = fromPoint.floor === 1 ? 0 : 2.65;
+        const toHeight = toPoint.floor === 1 ? 0 : 2.65;
+        const cost = Math.hypot(
+          toPoint.x - fromPoint.x,
+          toPoint.y - fromPoint.y,
+          toHeight - fromHeight
+        );
+        if (distance[current] + cost < distance[next]) {
+          distance[next] = distance[current] + cost;
+          previous[next] = current;
+          previousEdge[next] = edge.kind;
+        }
+      });
+    }
+
+    if (!Number.isFinite(distance.floor1_exit)) return [];
+    const routeIds = [];
+    for (let cursor = 'floor1_exit'; cursor; cursor = previous[cursor]) {
+      routeIds.unshift(cursor);
+      if (cursor === startId) break;
+    }
+    if (routeIds[0] !== startId) return [];
+    return routeIds.map((id, index) => ({
+      id,
+      ...BUILDING_ROUTE_POINTS[id],
+      edgeFromPrevious: index ? previousEdge[id] : null
+    }));
+  }
+
+  function buildingRouteStatus(route) {
+    const unknownNodes = [];
+    const blockedNodes = [];
+    route.forEach(point => {
+      if (!point.nodeId) return;
+      const node = overviewNodes[point.nodeId];
+      const freshness = nodeFreshness(node);
+      if (freshness !== 'online') {
+        unknownNodes.push(point.nodeId);
+        return;
+      }
+      const cameraBlocked = overviewCameras.some(camera =>
+        camera.node_id === point.nodeId && cameraFreshness(camera) === 'online' && camera.blocked
+      );
+      if (node.blocked || cameraBlocked) blockedNodes.push(point.nodeId);
+    });
+    if (blockedNodes.length) {
+      return {
+        kind: 'blocked',
+        message: `Blockage reported at ${blockedNodes.join(', ')}; route status unknown. No auto-reroute.`
+      };
+    }
+    if (unknownNodes.length) {
+      return {
+        kind: 'unknown',
+        message: `Sensor status unknown at ${unknownNodes.join(', ')}; dashed path is schematic only.`
+      };
+    }
+    return {
+      kind: 'clear',
+      message: 'No blockage reported by path nodes; route is still not verified.'
+    };
+  }
+
+  function drawBuildingRouteSegment(context, start, end, layout, color, dashed) {
+    const first = projectBuildingPoint(start.x, start.y, start.z, layout);
+    const last = projectBuildingPoint(end.x, end.y, end.z, layout);
+    context.save();
+    context.lineCap = 'round';
+    context.lineJoin = 'round';
+    context.setLineDash(dashed ? [6, 5] : []);
+    context.beginPath();
+    context.moveTo(first.x, first.y);
+    context.lineTo(last.x, last.y);
+    context.strokeStyle = '#081018';
+    context.lineWidth = 9;
+    context.stroke();
+    context.strokeStyle = color;
+    context.lineWidth = 4;
+    context.stroke();
+    context.restore();
+    return { first, last };
+  }
+
+  function drawBuildingChevron(context, first, last, color) {
+    const x = first.x + (last.x - first.x) * 0.62;
+    const y = first.y + (last.y - first.y) * 0.62;
+    const angle = Math.atan2(last.y - first.y, last.x - first.x);
+    const wing = 7;
+    context.beginPath();
+    context.moveTo(x - Math.cos(angle - 0.65) * wing, y - Math.sin(angle - 0.65) * wing);
+    context.lineTo(x, y);
+    context.lineTo(x - Math.cos(angle + 0.65) * wing, y - Math.sin(angle + 0.65) * wing);
+    context.strokeStyle = color;
+    context.lineWidth = 2.5;
+    context.stroke();
+  }
+
+  function drawBuildingStairBadge(context, point, direction, color) {
+    const center = projectBuildingPoint(point.x, point.y, point.z, point.layout);
+    const text = `${direction} · STAIRS`;
+    context.save();
+    context.font = '700 9px Inter, sans-serif';
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    const width = context.measureText(text).width + 12;
+    context.fillStyle = 'rgba(8,12,16,0.94)';
+    context.fillRect(center.x - width / 2, center.y - 9, width, 18);
+    context.strokeStyle = color;
+    context.lineWidth = 1;
+    context.strokeRect(center.x - width / 2, center.y - 9, width, 18);
+    context.fillStyle = color;
+    context.fillText(text, center.x, center.y);
+    context.restore();
+  }
+
+  function renderBuildingPath(context, layout, floors) {
+    const status = document.getElementById('building-path-status');
+    if (!buildingView.showPath) {
+      status.textContent = 'Path overlay hidden. Schematic routes are not verified guidance.';
+      return;
+    }
+    const route = shortestBuildingRoute(selectedNodeId);
+    if (!route.length) {
+      status.textContent = 'No schematic hallway/stair path is configured for this node.';
+      return;
+    }
+
+    const routeState = buildingRouteStatus(route);
+    const partial = route.some(point => !floors.includes(point.floor));
+    const modeMessage = routeState.kind === 'blocked' ? 'BLOCKED · ROUTE UNKNOWN' :
+      routeState.kind === 'unknown' ? 'STATUS UNKNOWN · PROTOTYPE PATH' : 'PROTOTYPE PATH · NOT VERIFIED';
+    status.textContent = `${modeMessage} · ${routeState.message}${partial ? ' Partial view; another floor is hidden.' : ''}`;
+    const color = routeState.kind === 'blocked' ? '#f85149' :
+      routeState.kind === 'unknown' ? '#d29922' : '#4c8dff';
+    const dashed = routeState.kind !== 'clear';
+
+    context.save();
+    for (let index = 1; index < route.length; index++) {
+      const from = route[index - 1];
+      const to = route[index];
+      const fromVisible = floors.includes(from.floor);
+      const toVisible = floors.includes(to.floor);
+      const fromPoint = {
+        x: from.x, y: from.y, z: buildingFloorBase(from.floor) + 0.14
+      };
+      const toPoint = {
+        x: to.x, y: to.y, z: buildingFloorBase(to.floor) + 0.14
+      };
+
+      if (fromVisible && toVisible) {
+        const line = drawBuildingRouteSegment(
+          context, fromPoint, toPoint, layout, color, dashed
+        );
+        if (to.edgeFromPrevious === 'stairs') {
+          const direction = from.floor > to.floor ? 'DOWN' : 'UP';
+          drawBuildingStairBadge(context, {
+            x: from.x,
+            y: from.y,
+            z: (fromPoint.z + toPoint.z) / 2,
+            layout
+          }, direction, color);
+          if (!dashed) drawBuildingChevron(context, line.first, line.last, color);
+        } else if (!dashed) {
+          drawBuildingChevron(context, line.first, line.last, color);
+        }
+      } else if (to.edgeFromPrevious === 'stairs' && (fromVisible || toVisible)) {
+        const visible = fromVisible ? fromPoint : toPoint;
+        const visibleFloor = fromVisible ? from.floor : to.floor;
+        const stub = {
+          x: visible.x,
+          y: visible.y,
+          z: visible.z + (visibleFloor === 1 ? 0.72 : -0.72)
+        };
+        drawBuildingRouteSegment(context, visible, stub, layout, color, true);
+        drawBuildingStairBadge(context, {
+          x: visible.x,
+          y: visible.y,
+          z: (visible.z + stub.z) / 2,
+          layout
+        }, `TO F${visibleFloor === 1 ? 2 : 1}`, color);
+      }
+    }
+    context.restore();
+  }
+
+  function buildingFloorBase(floor) {
+    if (floor === 1) return 0;
+    return buildingView.exploded ? 4.6 : 2.65;
+  }
+
+  function buildingPalette(kind) {
+    const palettes = {
+      slab: { top: '#2c3745', x: '#1b2530', y: '#222d3a', stroke: '#526174' },
+      wall: { top: '#7f8da0', x: '#435163', y: '#59697d', stroke: '#9aa7b7' },
+      room: { top: '#63373d', x: '#3e292f', y: '#512f36', stroke: '#b55b64' },
+      stair: { top: '#735b35', x: '#43371f', y: '#5d492b', stroke: '#c69a50' },
+      exit: { top: '#286b47', x: '#17452f', y: '#20573a', stroke: '#54c989' },
+      node: { top: '#4c8dff', x: '#274b87', y: '#3669b0', stroke: '#a5c5ff' },
+      stale: { top: '#d29922', x: '#785315', y: '#9a6c1b', stroke: '#f0c45b' },
+      blocked: { top: '#f85149', x: '#852c2a', y: '#b33b37', stroke: '#ff9b94' },
+      offline: { top: '#7b8795', x: '#434d58', y: '#5d6876', stroke: '#a3adba' }
+    };
+    return palettes[kind];
+  }
+
+  function addBuildingPrism(boxes, x1, x2, y1, y2, z1, z2, kind) {
+    boxes.push({ x1, x2, y1, y2, z1, z2, colors: buildingPalette(kind) });
+  }
+
+  function addBuildingArea(boxes, labels, x1, x2, y1, y2, base, kind, label, stairAxis) {
+    const colors = buildingPalette(kind);
+    addBuildingPrism(boxes, x1 + 0.04, x2 - 0.04, y1 + 0.04, y2 - 0.04,
+      base + 0.02, base + 0.08, kind);
+    const wallHeight = kind === 'room' ? 0.46 : 0.36;
+    const thickness = 0.1;
+    addBuildingPrism(boxes, x1, x2, y1, y1 + thickness, base + 0.04, base + wallHeight, kind);
+    addBuildingPrism(boxes, x1, x2, y2 - thickness, y2, base + 0.04, base + wallHeight, kind);
+    addBuildingPrism(boxes, x1, x1 + thickness, y1, y2, base + 0.04, base + wallHeight, kind);
+    addBuildingPrism(boxes, x2 - thickness, x2, y1, y2, base + 0.04, base + wallHeight, kind);
+
+    if (kind === 'stair') {
+      const steps = 5;
+      if (stairAxis === 'y') {
+        const run = (y2 - y1 - 0.3) / steps;
+        for (let index = 0; index < steps; index++) {
+          addBuildingPrism(boxes, x1 + 0.16, x2 - 0.16,
+            y1 + 0.15 + index * run, y1 + 0.15 + (index + 1) * run,
+            base + 0.08, base + 0.12 + (index + 1) * 0.055, 'stair');
+        }
+      } else {
+        const run = (x2 - x1 - 0.3) / steps;
+        for (let index = 0; index < steps; index++) {
+          addBuildingPrism(boxes,
+            x1 + 0.15 + index * run, x1 + 0.15 + (index + 1) * run,
+            y1 + 0.16, y2 - 0.16, base + 0.08,
+            base + 0.12 + (index + 1) * 0.055, 'stair');
+        }
+      }
+    }
+
+    labels.push({
+      text: label,
+      x: (x1 + x2) / 2,
+      y: (y1 + y2) / 2,
+      z: base + wallHeight + 0.08,
+      color: colors.stroke
+    });
+  }
+
+  function createBuildingLevel(floor, boxes, labels) {
+    const boxStart = boxes.length;
+    const base = buildingFloorBase(floor);
+    const depth = BUILDING_DEPTH;
+    addBuildingPrism(boxes, 0, BUILDING_WIDTH, 0, depth, base - 0.2, base, 'slab');
+    addBuildingArea(boxes, labels, 1.25, 4.95, 0.28, 3.2, base, 'room', 'ROOM · LEFT');
+    addBuildingArea(boxes, labels, 7.05, 10.75, 0.28, 3.2, base, 'room', 'ROOM · RIGHT');
+    addBuildingArea(boxes, labels, 0.2, 1.05, 0.28, 3.2, base, 'stair', 'STAIRS · LEFT', 'y');
+    addBuildingArea(boxes, labels, 10.95, 11.8, 0.28, 3.2, base, 'stair', 'STAIRS · RIGHT', 'y');
+    addBuildingArea(boxes, labels, 5.4, 6.6, 0.28, 1.35, base, 'stair', 'STAIRS · MID', 'x');
+    labels.push({ text: 'CORRIDOR', x: 6, y: 4.1, z: base + 0.08, color: '#9aa7b7' });
+
+    const wallBase = base + 0.04;
+    const wallTop = base + 0.58;
+    addBuildingPrism(boxes, 0, BUILDING_WIDTH, -0.12, 0, wallBase, wallTop, 'wall');
+    addBuildingPrism(boxes, -0.12, 0, 0, depth, wallBase, wallTop, 'wall');
+    addBuildingPrism(boxes, BUILDING_WIDTH, BUILDING_WIDTH + 0.12, 0, depth, wallBase, wallTop, 'wall');
+    if (floor === 1) {
+      addBuildingPrism(boxes, 0, 5.32, depth, depth + 0.12, wallBase, wallTop, 'wall');
+      addBuildingPrism(boxes, 6.68, BUILDING_WIDTH, depth, depth + 0.12, wallBase, wallTop, 'wall');
+      addBuildingPrism(boxes, 5.52, 6.48, depth + 0.2, depth + 0.62,
+        base, base + 0.1, 'exit');
+      labels.push({ text: 'EXIT', x: 6, y: depth + 0.88, z: base + 0.22, color: '#70dfa1' });
+    } else {
+      addBuildingPrism(boxes, 0, BUILDING_WIDTH, depth, depth + 0.12, wallBase, wallTop, 'wall');
+    }
+
+    Object.entries(BUILDING_NODE_POSITIONS).forEach(([id, position]) => {
+      if (position.floor !== floor) return;
+      const node = overviewNodes[id];
+      const freshness = nodeFreshness(node);
+      const cameraBlocked = overviewCameras.some(camera =>
+        camera.node_id === id && cameraFreshness(camera) === 'online' && camera.blocked
+      );
+      const blocked = freshness === 'online' && ((node && node.blocked) || cameraBlocked);
+      const kind = blocked ? 'blocked' :
+        freshness === 'online' ? 'node' :
+        freshness === 'stale' ? 'stale' : 'offline';
+      const labelX = position.x < BUILDING_WIDTH / 2 ? position.x + 1.1 :
+        position.x > BUILDING_WIDTH / 2 ? position.x - 1.1 : position.x;
+      addBuildingPrism(boxes, position.x - 0.17, position.x + 0.17,
+        position.y - 0.17, position.y + 0.17, base + 0.08, base + 0.48, kind);
+      labels.push({
+        text: `Node ${id.slice(-2)} · ${blocked ? 'BLOCKED' : freshness.toUpperCase()}`,
+        x: labelX,
+        y: position.y,
+        z: base + 0.64,
+        color: blocked ? '#ff9b94' : freshness === 'online' ? '#b7d1ff' :
+          freshness === 'stale' ? '#f0c45b' : '#c1c8d2'
+      });
+      if (node && freshness === 'online' && node.temperature != null &&
+          Number.isFinite(Number(node.temperature))) {
+        labels.push({
+          text: `${Number(node.temperature).toFixed(1)} °C`,
+          x: labelX,
+          y: position.y,
+          z: base + 0.82,
+          color: '#d8e0ea'
+        });
+      }
+    });
+    boxes.slice(boxStart).forEach(box => { box.floor = floor; });
+  }
+
+  function buildingModelLayout(width, height, floors) {
+    const bases = floors.map(buildingFloorBase);
+    const minZ = Math.min(...bases) - 0.2;
+    const maxZ = Math.max(...bases) + 0.9;
+    const cosYaw = Math.cos(buildingView.yaw);
+    const sinYaw = Math.sin(buildingView.yaw);
+    const sinElevation = Math.sin(buildingView.elevation);
+    const cosElevation = Math.cos(buildingView.elevation);
+    const projected = [];
+    [0, BUILDING_WIDTH].forEach(x => [-0.3, BUILDING_DEPTH + 1.1].forEach(y => {
+      [minZ, maxZ].forEach(z => projected.push({
+        x: x * cosYaw - y * sinYaw,
+        y: (x * sinYaw + y * cosYaw) * sinElevation - z * cosElevation
+      }));
+    }));
+    const minX = Math.min(...projected.map(point => point.x));
+    const maxX = Math.max(...projected.map(point => point.x));
+    const minY = Math.min(...projected.map(point => point.y));
+    const maxY = Math.max(...projected.map(point => point.y));
+    const scale = Math.min((width - 72) / (maxX - minX), (height - 72) / (maxY - minY)) *
+      buildingView.zoom;
+    return {
+      scale,
+      centerX: width / 2 - (minX + maxX) * scale / 2 + buildingView.panX,
+      centerY: height / 2 - (minY + maxY) * scale / 2 + buildingView.panY,
+      cosYaw,
+      sinYaw,
+      sinElevation,
+      cosElevation
+    };
+  }
+
+  function projectBuildingPoint(x, y, z, layout) {
+    return {
+      x: layout.centerX + (x * layout.cosYaw - y * layout.sinYaw) * layout.scale,
+      y: layout.centerY + ((x * layout.sinYaw + y * layout.cosYaw) * layout.sinElevation -
+        z * layout.cosElevation) * layout.scale
+    };
+  }
+
+  function buildingBoxFaces(box, layout) {
+    const points = (coords, color) => {
+      const projected = coords.map(([x, y, z]) => projectBuildingPoint(x, y, z, layout));
+      const depth = coords.reduce((sum, [x, y, z]) =>
+        sum + (x * layout.sinYaw + y * layout.cosYaw) * layout.cosElevation +
+          z * layout.sinElevation, 0) / coords.length;
+      return {
+        points: projected,
+        color,
+        depth,
+        stroke: box.colors.stroke,
+        opacity: buildingView.level === 'both' && buildingView.cutaway && box.floor === 2 ? 0.32 : 1
+      };
+    };
+    const xSide = layout.sinYaw > 0 ? box.x2 : box.x1;
+    const ySide = layout.cosYaw > 0 ? box.y2 : box.y1;
+    return [
+      points([
+        [box.x1, box.y1, box.z2], [box.x2, box.y1, box.z2],
+        [box.x2, box.y2, box.z2], [box.x1, box.y2, box.z2]
+      ], box.colors.top),
+      points([
+        [xSide, box.y1, box.z1], [xSide, box.y2, box.z1],
+        [xSide, box.y2, box.z2], [xSide, box.y1, box.z2]
+      ], box.colors.x),
+      points([
+        [box.x1, ySide, box.z1], [box.x2, ySide, box.z1],
+        [box.x2, ySide, box.z2], [box.x1, ySide, box.z2]
+      ], box.colors.y)
+    ];
+  }
+
+  function drawBuildingLabel(context, label, layout) {
+    const point = projectBuildingPoint(label.x, label.y, label.z, layout);
+    context.save();
+    context.font = '600 10px Inter, sans-serif';
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    context.fillStyle = label.color;
+    context.shadowColor = '#080c10';
+    context.shadowBlur = 4;
+    context.fillText(label.text, point.x, point.y);
+    context.restore();
+  }
+
+  function renderBuildingNodeList() {
+    document.querySelectorAll('.model-node-pick').forEach(button => {
+      const id = button.dataset.modelNodeId;
+      const node = overviewNodes[id];
+      const freshness = nodeFreshness(node);
+      const cameraBlocked = overviewCameras.some(camera =>
+        camera.node_id === id && cameraFreshness(camera) === 'online' && camera.blocked
+      );
+      const blocked = freshness === 'online' && ((node && node.blocked) || cameraBlocked);
+      button.classList.remove('online', 'stale', 'offline', 'blocked');
+      button.classList.add(freshness === 'unregistered' ? 'offline' : freshness);
+      if (blocked) button.classList.add('blocked');
+      button.classList.toggle('selected', id === selectedNodeId);
+      button.setAttribute('aria-pressed', id === selectedNodeId ? 'true' : 'false');
+      button.querySelector('.model-node-state').textContent = blocked ? 'Blocked' :
+        freshness === 'unregistered' ? 'Not registered' :
+        freshness === 'online' ? 'Online' :
+        freshness === 'stale' ? 'Stale' : 'Offline';
+    });
+  }
+
+  function renderBuildingModel() {
+    renderBuildingNodeList();
+    const canvas = document.getElementById('building-model-canvas');
+    if (!canvas) return;
+    const bounds = canvas.getBoundingClientRect();
+    if (!bounds.width || !bounds.height) return;
+
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    const pixelWidth = Math.round(bounds.width * pixelRatio);
+    const pixelHeight = Math.round(bounds.height * pixelRatio);
+    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+      canvas.width = pixelWidth;
+      canvas.height = pixelHeight;
+    }
+    const context = canvas.getContext('2d');
+    context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    context.clearRect(0, 0, bounds.width, bounds.height);
+    context.fillStyle = '#0c121a';
+    context.fillRect(0, 0, bounds.width, bounds.height);
+
+    const floors = visibleBuildingFloors();
+    const layout = buildingModelLayout(bounds.width, bounds.height, floors);
+    const boxes = [];
+    const labels = [];
+    floors.forEach(floor => createBuildingLevel(floor, boxes, labels));
+    const faces = boxes.flatMap(box => buildingBoxFaces(box, layout));
+    faces.sort((left, right) => left.depth - right.depth);
+    faces.forEach(face => {
+      context.beginPath();
+      context.moveTo(face.points[0].x, face.points[0].y);
+      face.points.slice(1).forEach(point => context.lineTo(point.x, point.y));
+      context.closePath();
+      context.fillStyle = face.color;
+      context.globalAlpha = face.opacity;
+      context.fill();
+      context.strokeStyle = face.stroke;
+      context.lineWidth = 0.65;
+      context.stroke();
+      context.globalAlpha = 1;
+    });
+    renderBuildingPath(context, layout, floors);
+    labels.forEach(label => drawBuildingLabel(context, label, layout));
+
+    buildingNodeHits = [];
+    Object.entries(BUILDING_NODE_POSITIONS).forEach(([id, position]) => {
+      if (!floors.includes(position.floor)) return;
+      const point = projectBuildingPoint(position.x, position.y,
+        buildingFloorBase(position.floor) + 0.5, layout);
+      buildingNodeHits.push({ id, x: point.x, y: point.y });
+      if (id === selectedNodeId) {
+        context.beginPath();
+        context.arc(point.x, point.y, 13, 0, Math.PI * 2);
+        context.strokeStyle = '#ffffff';
+        context.lineWidth = 2;
+        context.stroke();
+      }
+    });
+
+    context.font = '600 10px Inter, sans-serif';
+    context.textAlign = 'left';
+    context.textBaseline = 'top';
+    floors.forEach((floor, index) => {
+      context.fillStyle = '#cbd5e1';
+      context.fillText(floor === 1 ? 'FLOOR 1 · GROUND' : 'FLOOR 2', 14, 14 + index * 16);
+    });
+  }
+
   function selectOverviewNode(nodeId) {
     stopOverviewStreams();
     selectedNodeId = nodeId;
     renderSelectedNode();
+    renderBuildingModel();
   }
 
   function selectNodeMedia(media, button) {
@@ -2140,6 +2892,7 @@ HTML_TEMPLATE = """
   document.querySelectorAll('.map-node-marker').forEach(marker => {
     marker.addEventListener('click', () => selectOverviewNode(marker.dataset.nodeId));
   });
+  initializeBuildingModel();
   registerSettingsForm(
     'threshold-form',
     '/api/settings/thresholds',
@@ -2347,6 +3100,7 @@ HTML_TEMPLATE = """
       blocked.length ? blocked.join(' · ') : 'Offline or stale areas have unknown status.';
 
     renderSelectedNode();
+    renderBuildingModel();
   }
 
   function renderSelectedNode() {

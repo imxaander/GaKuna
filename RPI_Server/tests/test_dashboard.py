@@ -50,6 +50,19 @@ class DashboardTests(unittest.TestCase):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Prototype guidance", response.data)
+        self.assertIn(b'id="building-model-canvas"', response.data)
+        self.assertIn(b"function renderBuildingModel()", response.data)
+        self.assertIn(b"function shortestBuildingRoute(startId)", response.data)
+        self.assertIn(b"id=\"building-model-cutaway\"", response.data)
+        self.assertIn(b"id=\"building-model-path\"", response.data)
+        self.assertIn(b"id=\"building-path-status\"", response.data)
+        self.assertIn(b"View original 2D floor plans", response.data)
+        self.assertIn(b"Shift+drag to pan", response.data)
+        for marker in server.FLOOR_MAP_NODES:
+            self.assertIn(
+                f'data-model-node-id="{marker["id"]}"'.encode(),
+                response.data,
+            )
         self.assertIn(b"edge-left", response.data)
         self.assertIn(b"edge-right", response.data)
         floor_one = self.client.get("/static/maps/floor-1.png")

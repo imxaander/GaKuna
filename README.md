@@ -24,9 +24,18 @@ additional devices from the dashboard's **Settings** tab:
 - A camera ID must match `CAMERA_ID` in its ESP32-CAM firmware. Leave its URL
   blank for the TCP frame stream, or enter an HTTP snapshot URL.
 
-The **Overview** tab shows the supplied Floor 1 and Floor 2 schematics. Select
-a node marker to view its IP, firmware version, last-seen time, DHT22 readings,
-and either its MLX90640 thermal feed or assigned ESP32-CAM feed. The ESP32 node
+The **Overview** tab includes an interactive isometric 3D schematic based on
+the supplied floor plans. Drag to orbit, scroll to zoom, and use Shift-drag to
+pan; switch between floors, separate them, or enable the upper-floor cutaway
+to inspect both levels. Selecting a model node generates a prototype path along
+the configured hallway/stair graph to the Floor 1 exit. The stair transition is
+drawn as a vertical connector with an UP/DOWN badge. A reported blockage or
+stale/offline path-node telemetry marks the path status unknown; the prototype
+does not automatically reroute and is not approved evacuation guidance. Select
+a model node to view its IP, firmware version, last-seen time, DHT22 readings,
+and either its MLX90640 thermal feed or assigned ESP32-CAM feed. The original
+2D plans remain available below the model. The 3D room and wall heights are
+illustrative because the plans do not specify dimensions. The ESP32 node
 firmware sends DHT22 humidity and firmware version along with its other sensor
 data; set the node's ID in the sketch to the matching registry ID before
 flashing each physical node. Before compiling, copy
