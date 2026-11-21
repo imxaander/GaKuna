@@ -89,3 +89,12 @@ SOUND_TRACKS = {
     "up": "Go up",
     "other_side": "Go to the other side",
 }
+
+# Alert threshold defaults
+ALERT_THRESHOLDS = {
+    "ambient_warning_c": 30.0,
+    "ambient_critical_c": 40.0,
+    "thermal_warning_c": 35.0,
+    "thermal_critical_c": 50.0,
+}
+

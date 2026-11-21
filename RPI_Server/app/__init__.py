@@ -1,4 +1,5 @@
 """GaKuna Flask application factory."""
+import os
 from flask import Flask
 from flask_socketio import SocketIO
 
@@ -7,7 +8,16 @@ socketio = SocketIO()
 
 def create_app(config=None):
     """Create and configure Flask app."""
-    app = Flask(__name__)
+    # Get the app directory
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(app_dir)
+    
+    # Create Flask app with templates folder pointing to parent/templates
+    app = Flask(
+        __name__,
+        template_folder=os.path.join(parent_dir, 'templates'),
+        static_folder=os.path.join(parent_dir, 'static')
+    )
     
     # Load config
     if config is None:
