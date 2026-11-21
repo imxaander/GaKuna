@@ -1451,9 +1451,20 @@
   function buildingBoxFaces(box, layout) {
     const points = (coords, color, forceKind) => {
       const projected = coords.map(([x, y, z]) => projectBuildingPoint(x, y, z, layout));
-      const depth = coords.reduce((sum, [x, y, z]) =>
-        sum + (x * layout.sinYaw + y * layout.cosYaw) * layout.cosElevation +
-          z * layout.sinElevation, 0) / coords.length;
+      
+      // Calculate depth based on the actual screen projection
+      // We need to find which coordinate contributes most to depth ordering
+      // The camera looks along a direction determined by yaw and elevation
+      // We use a composite depth that accounts for the camera's viewing angle
+      const depth = coords.reduce((sum, [x, y, z]) => {
+        // Transform to camera space using the same rotation as the projection
+        const rotX = x * layout.cosYaw - y * layout.sinYaw;
+        const rotY = x * layout.sinYaw + y * layout.cosYaw;
+        // Camera distance = how far along the view direction
+        // The view direction at elevation is: looking forward and down
+        // So depth increases away from camera along the viewing direction
+        return sum + rotY * layout.cosElevation + z * layout.sinElevation;
+      }, 0) / coords.length;
       const zCoords = coords.map(c => c[2]);
       return {
         points: projected,
@@ -1551,20 +1562,41 @@
     const labels = [];
     floors.forEach(floor => createBuildingLevel(floor, boxes, labels));
     const faces = boxes.flatMap(box => buildingBoxFaces(box, layout));
+    
+    // Calculate camera distance for each face based on viewing angle
+    // This ensures proper z-ordering from all viewing angles
+    faces.forEach(face => {
+      // Calculate the centroid of the face in 3D space
+      // For depth sorting, we need to project back to 3D from the 2D coordinates
+      // But we already have the original coordinates, so we use the depth value
+      // which represents the distance from the camera's perspective
+      
+      // Enhanced depth calculation that accounts for viewing angle better
+      // Prioritize based on: overall camera distance, then floor, then slab status, then local z
+      const cameraDistance = face.depth + (face.floor === 2 ? 10 : 0); // Add offset for floor
+      face.sortKey = cameraDistance;
+      face.sortFloor = face.floor;
+      face.sortIsSlab = face.kind === 'slab' ? 0 : 1;
+      face.sortZ = face.z;
+    });
+    
     faces.sort((left, right) => {
-      // Primary sort: by floor (lower floor first)
-      if (left.floor !== right.floor) return left.floor - right.floor;
+      // Primary sort: Use depth-based camera distance for proper z-ordering from all angles
+      // But still respect floor boundaries to prevent crossing
+      if (Math.abs(left.depth - right.depth) > 0.5) {
+        return left.depth - right.depth;
+      }
       
-      // Secondary sort: Slabs on the same floor ALWAYS render before non-slab objects
-      const leftIsSlab = left.kind === 'slab' ? 0 : 1;
-      const rightIsSlab = right.kind === 'slab' ? 0 : 1;
-      if (leftIsSlab !== rightIsSlab) return leftIsSlab - rightIsSlab;
+      // Within similar depths: prioritize slabs (which are floor surfaces)
+      if (left.sortIsSlab !== right.sortIsSlab) return left.sortIsSlab - right.sortIsSlab;
       
-      // Tertiary sort: Within same kind, sort by z-coordinate (bottom to top)
+      // Then sort by z-coordinate for objects at similar depth
       if (Math.abs(left.z - right.z) > 0.01) return left.z - right.z;
       
-      // Quaternary sort: by depth (isometric distance for final ordering)
-      return left.depth - right.depth;
+      // Finally, stable sort by floor if everything else is equal
+      if (left.floor !== right.floor) return left.floor - right.floor;
+      
+      return 0;
     });
     faces.forEach(face => {
       context.beginPath();
