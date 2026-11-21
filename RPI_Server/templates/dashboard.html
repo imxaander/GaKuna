@@ -545,8 +545,12 @@
             Separate floors
           </label>
           <label class="model-explode-toggle">
-            <input type="checkbox" id="building-model-cutaway" checked>
-            Cutaway upper floor
+            <input type="checkbox" id="building-model-cutaway1">
+            Cutaway floor 1
+          </label>
+          <label class="model-explode-toggle">
+            <input type="checkbox" id="building-model-cutaway2" checked>
+            Cutaway floor 2
           </label>
           <label class="model-explode-toggle">
             <input type="checkbox" id="building-model-path" checked>
@@ -894,7 +898,7 @@
   const BUILDING_DEPTH = 6.1;
   const buildingView = {
     level: 'both', yaw: -0.72, elevation: 0.62, zoom: 1, panX: 0, panY: 0,
-    exploded: false, cutaway: true, showPath: true
+    exploded: false, cutaway1: false, cutaway2: true, showPath: true
   };
   const BUILDING_ROUTE_POINTS = {
     node_11: { floor: 1, x: 0.5, y: 5.1, nodeId: 'node_11' },
@@ -1034,8 +1038,12 @@
       buildingView.exploded = event.target.checked;
       renderBuildingModel();
     });
-    document.getElementById('building-model-cutaway').addEventListener('change', event => {
-      buildingView.cutaway = event.target.checked;
+    document.getElementById('building-model-cutaway1').addEventListener('change', event => {
+      buildingView.cutaway1 = event.target.checked;
+      renderBuildingModel();
+    });
+    document.getElementById('building-model-cutaway2').addEventListener('change', event => {
+      buildingView.cutaway2 = event.target.checked;
       renderBuildingModel();
     });
     document.getElementById('building-model-path').addEventListener('change', event => {
@@ -1457,7 +1465,7 @@
         zMin: Math.min(...zCoords),
         zMax: Math.max(...zCoords),
         stroke: box.colors.stroke,
-        opacity: buildingView.level === 'both' && buildingView.cutaway && box.floor === 2 ? 0.32 : 1
+        opacity: buildingView.level === 'both' && ((box.floor === 1 && buildingView.cutaway1) || (box.floor === 2 && buildingView.cutaway2)) ? 0.32 : 1
       };
     };
     const xSide = layout.sinYaw > 0 ? box.x2 : box.x1;
