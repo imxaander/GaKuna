@@ -8,6 +8,7 @@ Access dashboard at: http://<pi-ip>:8080
 """
 
 import json
+import math
 import os
 import re
 import socket
@@ -38,9 +39,16 @@ socketio = SocketIO(
 # NODE CONFIGURATION
 # ─────────────────────────────────────────────
 DEFAULT_NODE_CONFIG = [
-    {"id": "node_1", "name": "Node 11 - Floor 1 Left",   "ip": "DHCP", "port": 5001},
-    {"id": "node_2", "name": "Node 12 - Floor 1 Left",   "ip": "DHCP", "port": 5001},
+    {"id": "node_11", "name": "Node 11 - Floor 1 left end", "ip": "DHCP", "port": 5001},
+    {"id": "node_12", "name": "Node 12 - Floor 1 right end", "ip": "DHCP", "port": 5001},
+    {"id": "node_21", "name": "Node 21 - Floor 2 left end", "ip": "DHCP", "port": 5001},
+    {"id": "node_22", "name": "Node 22 - Floor 2 middle", "ip": "DHCP", "port": 5001},
+    {"id": "node_23", "name": "Node 23 - Floor 2 right end", "ip": "DHCP", "port": 5001},
 ]
+LEGACY_DEFAULT_NODE_IDS = {
+    "node_1": ("node_11", "Node 11 - Floor 1 Left", "Node 11 - Floor 1 left end"),
+    "node_2": ("node_12", "Node 12 - Floor 1 Left", "Node 12 - Floor 1 right end"),
+}
 DATABASE_PATH = os.environ.get(
     "GAKUNA_DATABASE_PATH",
     os.environ.get(
@@ -60,6 +68,20 @@ def load_node_configs():
                     port INTEGER NOT NULL
                 )
             """)
+            for old_id, (new_id, old_name, new_name) in LEGACY_DEFAULT_NODE_IDS.items():
+                legacy_node = database.execute(
+                    "SELECT 1 FROM node_registry WHERE id = ? AND name = ?",
+                    (old_id, old_name),
+                ).fetchone()
+                mapped_node = database.execute(
+                    "SELECT 1 FROM node_registry WHERE id = ?",
+                    (new_id,),
+                ).fetchone()
+                if legacy_node and not mapped_node:
+                    database.execute(
+                        "UPDATE node_registry SET id = ?, name = ? WHERE id = ?",
+                        (new_id, new_name, old_id),
+                    )
             database.executemany(
                 "INSERT OR IGNORE INTO node_registry (id, name, ip, port) VALUES (?, ?, ?, ?)",
                 [(node["id"], node["name"], node["ip"], node["port"]) for node in DEFAULT_NODE_CONFIG],
@@ -71,6 +93,43 @@ def load_node_configs():
     return [dict(row) for row in rows]
 
 NODE_CONFIG = load_node_configs()
+
+FLOOR_MAP_NODES = [
+    {"id": "node_11", "label": "11", "area": "Floor 1 · Left end", "floor": 1, "left": 6.7, "top": 55.0, "edge": "left"},
+    {"id": "node_12", "label": "12", "area": "Floor 1 · Right end", "floor": 1, "left": 95.0, "top": 55.0, "edge": "right"},
+    {"id": "node_21", "label": "21", "area": "Floor 2 · Left end", "floor": 2, "left": 5.9, "top": 60.0, "edge": "left"},
+    {"id": "node_22", "label": "22", "area": "Floor 2 · Middle", "floor": 2, "left": 50.0, "top": 66.0},
+    {"id": "node_23", "label": "23", "area": "Floor 2 · Right end", "floor": 2, "left": 94.0, "top": 60.0, "edge": "right"},
+]
+
+ALERT_THRESHOLD_KEYS = (
+    "ambient_warning_c",
+    "ambient_critical_c",
+    "thermal_warning_c",
+    "thermal_critical_c",
+)
+
+
+def load_alert_thresholds():
+    with closing(sqlite3.connect(DATABASE_PATH)) as database:
+        with database:
+            database.execute("""
+                CREATE TABLE IF NOT EXISTS dashboard_settings (
+                    key TEXT PRIMARY KEY,
+                    value REAL
+                )
+            """)
+            database.executemany(
+                "INSERT OR IGNORE INTO dashboard_settings (key, value) VALUES (?, NULL)",
+                [(key,) for key in ALERT_THRESHOLD_KEYS],
+            )
+            rows = database.execute(
+                "SELECT key, value FROM dashboard_settings"
+            ).fetchall()
+    return {key: value for key, value in rows}
+
+
+ALERT_THRESHOLDS = load_alert_thresholds()
 
 # Listen on all interfaces; ESP32s connect to the Pi's router-assigned address.
 PI_HOST = '0.0.0.0'
@@ -95,7 +154,7 @@ DEFAULT_CAMERA_CONFIG = [
         "id":         "cam_1",
         "name":       "Camera - Node 11",
         "url":        None,  # Uses the ESP32-CAM TCP stream on CAMERA_STREAM_PORT
-        "node_id":    "node_1",
+        "node_id":    "node_11",
         "enabled":    True,
     },
 ]
@@ -124,6 +183,10 @@ def load_camera_configs():
                     )
                     for camera in DEFAULT_CAMERA_CONFIG
                 ],
+            )
+            database.execute(
+                "UPDATE camera_registry SET node_id = 'node_11' "
+                "WHERE id = 'cam_1' AND name = 'Camera - Node 11' AND node_id = 'node_1'"
             )
             database.row_factory = sqlite3.Row
             rows = database.execute(
@@ -171,6 +234,7 @@ class CameraState:
         self.debris_count   = 0
         self.closest_debris = None   # cm
         self.last_seen      = None
+        self.last_seen_epoch = None
         self.error          = None
         self.latest_frame   = None   # JPEG bytes for live view
         self.tcp_frame      = None   # Raw JPEG received from ESP32-CAM
@@ -180,6 +244,11 @@ class CameraState:
         self.lock           = threading.Lock()
 
     def to_dict(self):
+        last_seen_age = (
+            max(0, time.time() - self.last_seen_epoch)
+            if self.last_seen_epoch is not None
+            else None
+        )
         return {
             "id":             self.id,
             "name":           self.name,
@@ -190,6 +259,8 @@ class CameraState:
             "debris_count":   self.debris_count,
             "closest_debris": self.closest_debris,
             "last_seen":      self.last_seen,
+            "last_seen_age_seconds": last_seen_age,
+            "stale":          self.enabled and (last_seen_age is None or last_seen_age > 5),
             "error":          self.error,
         }
 
@@ -222,6 +293,8 @@ class NodeState:
         self.ip               = config["ip"]
         self.port             = config["port"]
         self.temperature      = None
+        self.humidity         = None
+        self.firmware_version = None
         self.seismic          = None
         self.blocked          = False
         self.thermal          = None    # MLX90640 hotspot (°C)
@@ -234,15 +307,24 @@ class NodeState:
         self.override_command = "OFF"
         self.connected        = False
         self.last_seen        = None
+        self.last_seen_epoch  = None
         self.conn             = None
         self.lock             = threading.Lock()
 
     def to_dict(self):
+        last_seen_age = (
+            max(0, time.time() - self.last_seen_epoch)
+            if self.last_seen_epoch is not None
+            else None
+        )
         return {
             "id":               self.id,
             "name":             self.name,
             "ip":               self.ip,
+            "port":             self.port,
             "temperature":      self.temperature,
+            "humidity":         self.humidity,
+            "firmware_version": self.firmware_version,
             "seismic":          self.seismic,
             "blocked":          self.blocked,
             "thermal":          self.thermal,
@@ -255,6 +337,9 @@ class NodeState:
             "override_command": self.override_command,
             "connected":        self.connected,
             "last_seen":        self.last_seen,
+            "last_seen_epoch":  self.last_seen_epoch,
+            "last_seen_age_seconds": last_seen_age,
+            "stale":            self.connected and (last_seen_age is None or last_seen_age > 5),
         }
 
     def send_command(self, command):
@@ -288,6 +373,17 @@ class NodeState:
 
 nodes = {cfg["id"]: NodeState(cfg) for cfg in NODE_CONFIG}
 nodes_lock = threading.RLock()
+
+def valid_sensor_reading(value, minimum=-300, maximum=300):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        reading = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(reading) or reading == -127 or not minimum <= reading <= maximum:
+        return None
+    return round(reading, 1)
 
 def node_snapshot():
     with nodes_lock:
@@ -559,6 +655,7 @@ def camera_loop(cam):
             cam.debris_count   = debris_count
             cam.closest_debris = round(closest, 1) if closest else None
             cam.last_seen      = time.strftime("%H:%M:%S")
+            cam.last_seen_epoch = time.time()
             cam.error          = None
             cam.latest_frame   = jpeg.tobytes()
 
@@ -756,6 +853,7 @@ def handle_esp32_connection(conn, addr):
                             node.ip        = client_ip
                             node.conn      = conn
                             node.connected = True
+                            node.last_seen_epoch = time.time()
                         registered = True
                         print(f"[+] {node.name} connected from {client_ip}")
                         socketio.emit('node_update', node.to_dict())
@@ -767,9 +865,27 @@ def handle_esp32_connection(conn, addr):
                         thermal_img, thermal_min, thermal_max = render_thermal(frame)
 
                     with node.lock:
-                        node.temperature = sensor_data.get("temp",     node.temperature)
-                        node.seismic     = sensor_data.get("seismic",  node.seismic)
-                        node.thermal     = sensor_data.get("thermal",  node.thermal)
+                        if "temp" in sensor_data:
+                            node.temperature = valid_sensor_reading(
+                                sensor_data["temp"], minimum=-40, maximum=80
+                            )
+                        if "humidity" in sensor_data:
+                            node.humidity = valid_sensor_reading(
+                                sensor_data["humidity"], minimum=0, maximum=100
+                            )
+                        if "firmware_version" in sensor_data:
+                            version = sensor_data["firmware_version"]
+                            node.firmware_version = (
+                                version.strip()[:40]
+                                if isinstance(version, str) and version.strip()
+                                else None
+                            )
+                        if "seismic" in sensor_data:
+                            node.seismic = valid_sensor_reading(sensor_data["seismic"])
+                        if "thermal" in sensor_data:
+                            node.thermal = valid_sensor_reading(
+                                sensor_data["thermal"], minimum=-40, maximum=300
+                            )
                         if thermal_img:
                             node.thermal_img  = thermal_img
                             node.thermal_min  = round(thermal_min, 1)
@@ -780,6 +896,7 @@ def handle_esp32_connection(conn, addr):
                         if not cam_watching:
                             node.blocked = sensor_data.get("blocked", node.blocked)
                         node.last_seen = time.strftime("%H:%M:%S")
+                        node.last_seen_epoch = time.time()
 
                     socketio.emit('node_update', node.to_dict())
                     cmd = node.override_command if node.override else auto_determine_sign(node)
@@ -796,12 +913,16 @@ def handle_esp32_connection(conn, addr):
                                 node.ip        = client_ip
                                 node.conn      = conn
                                 node.connected = True
+                                node.last_seen_epoch = time.time()
                             registered = True
                             print(f"[+] {node.name} connected from {client_ip}")
                             socketio.emit('node_update', node.to_dict())
                         with node.lock:
-                            node.temperature = temp
+                            node.temperature = valid_sensor_reading(
+                                temp, minimum=-40, maximum=80
+                            )
                             node.last_seen   = time.strftime("%H:%M:%S")
+                            node.last_seen_epoch = time.time()
                         socketio.emit('node_update', node.to_dict())
                         cmd = node.override_command if node.override else auto_determine_sign(node)
                         node.send_command(cmd)
@@ -854,11 +975,66 @@ def index():
         HTML_TEMPLATE,
         nodes=node_snapshot(),
         sound_tracks=SOUND_TRACKS,
+        floor_map_nodes=FLOOR_MAP_NODES,
+        alert_thresholds=ALERT_THRESHOLDS,
     )
 
 @app.route('/api/nodes')
 def api_nodes():
     return jsonify([n.to_dict() for n in node_snapshot()])
+
+@app.route('/api/settings/thresholds', methods=['GET', 'POST'])
+def api_threshold_settings():
+    global ALERT_THRESHOLDS
+
+    if request.method == 'GET':
+        return jsonify(ALERT_THRESHOLDS)
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected a JSON object"}), 400
+
+    thresholds = {}
+    for key in ALERT_THRESHOLD_KEYS:
+        value = data.get(key)
+        if value is None or value == '':
+            thresholds[key] = None
+            continue
+        if isinstance(value, bool):
+            return jsonify({"error": f"{key} must be a number or blank"}), 400
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return jsonify({"error": f"{key} must be a number or blank"}), 400
+        minimum = -40 if key.startswith("ambient_") else -40
+        maximum = 100 if key.startswith("ambient_") else 300
+        if not math.isfinite(number) or not minimum <= number <= maximum:
+            return jsonify({
+                "error": f"{key} must be between {minimum} and {maximum} °C"
+            }), 400
+        thresholds[key] = number
+
+    for kind in ("ambient", "thermal"):
+        warning = thresholds[f"{kind}_warning_c"]
+        critical = thresholds[f"{kind}_critical_c"]
+        if (warning is None) != (critical is None):
+            return jsonify({
+                "error": f"Set both {kind} warning and critical thresholds, or leave both blank"
+            }), 400
+        if warning is not None and warning >= critical:
+            return jsonify({
+                "error": f"{kind.capitalize()} critical threshold must be higher than warning"
+            }), 400
+
+    with closing(sqlite3.connect(DATABASE_PATH)) as database:
+        with database:
+            database.executemany(
+                "UPDATE dashboard_settings SET value = ? WHERE key = ?",
+                [(thresholds[key], key) for key in ALERT_THRESHOLD_KEYS],
+            )
+    ALERT_THRESHOLDS = thresholds
+    socketio.emit('thresholds_update', ALERT_THRESHOLDS)
+    return jsonify(ALERT_THRESHOLDS)
 
 @app.route('/api/nodes', methods=['POST'])
 def api_add_node():
@@ -1273,7 +1449,7 @@ HTML_TEMPLATE = """
   .sign-state.OFF   { color: var(--off-color); }
   .override-badge { display: inline-flex; align-items: center; gap: 4px; background: rgba(255,170,0,0.15); border: 1px solid rgba(255,170,0,0.3); color: var(--warn); font-size: 10px; padding: 2px 8px; border-radius: 20px; letter-spacing: 1px; text-transform: uppercase; font-family: 'Share Tech Mono', monospace; }
   .auto-badge { display: inline-flex; align-items: center; gap: 4px; background: rgba(0,255,136,0.1); border: 1px solid rgba(0,255,136,0.2); color: var(--accent); font-size: 10px; padding: 2px 8px; border-radius: 20px; letter-spacing: 1px; text-transform: uppercase; font-family: 'Share Tech Mono', monospace; }
-  .sensor-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; background: var(--border); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+  .sensor-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--border); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
   .sensor-item { background: var(--surface); padding: 12px 16px; text-align: center; }
   .sensor-value { font-family: 'Share Tech Mono', monospace; font-size: 18px; color: var(--text); }
   .sensor-value.danger { color: var(--danger); }
@@ -1288,6 +1464,7 @@ HTML_TEMPLATE = """
   .cameras-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 20px; margin-bottom: 32px; }
   .camera-card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
   .camera-card.blocked-active { border-color: rgba(255,68,85,0.5); box-shadow: 0 0 20px rgba(255,68,85,0.15); }
+  .camera-card.camera-stale .camera-feed { opacity: 0.45; }
   .camera-header { padding: 14px 20px; background: var(--surface2); border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
   .camera-name { font-weight: 600; font-size: 14px; }
   .camera-node { font-size: 11px; color: var(--muted); font-family: 'Share Tech Mono', monospace; }
@@ -1402,6 +1579,7 @@ HTML_TEMPLATE = """
   .node-card, .camera-card, .devices-table, .log-section, .thermal-card {
     border-radius: 14px; background: var(--surface); border: 1px solid var(--border); }
   .node-card.connected { border-color: #2f3a48; box-shadow: none; }
+  .node-card.stale { border-color: rgba(210,153,34,0.65); }
   .node-card.override-active { border-color: rgba(210,153,34,0.55); box-shadow: none; }
   .node-header, .camera-header, .log-header { background: var(--surface2); }
   .conn-dot.online, .alive-dot.online { background: var(--success); box-shadow: none; animation: pulse 2s infinite; }
@@ -1414,7 +1592,7 @@ HTML_TEMPLATE = """
   .sign-icon.OFF   { background: var(--surface2);        border-color: var(--border); }
   .sign-state { font-weight: 700; }
 
-  .auto-badge, .override-badge, .blocked-badge, .clear-badge, .device-count {
+  .auto-badge, .override-badge, .blocked-badge, .clear-badge, .stale-badge, .disabled-badge, .device-count {
     display: inline-flex; align-items: center; gap: 6px; letter-spacing: 0.5px; font-weight: 500; }
   .auto-badge .icon, .override-badge .icon,
   .blocked-badge .icon, .clear-badge .icon { width: 12px; height: 12px; }
@@ -1442,6 +1620,9 @@ HTML_TEMPLATE = """
           text-transform: uppercase; border: 1px solid var(--border); color: var(--muted);
           background: var(--surface2); }
   .pill-live { color: var(--success); border-color: rgba(63,185,80,0.30); background: rgba(63,185,80,0.12); }
+  .pill-stale, .stale-badge { color: var(--warn); border-color: rgba(210,153,34,0.35); background: rgba(210,153,34,0.10); }
+  .disabled-badge { color: var(--muted); border-color: var(--border); background: var(--surface2); }
+  .thermal-card.stale-thermal .thermal-feed { opacity: 0.45; }
   .thermal-view { position: relative; background: #05070a; }
   .thermal-feed { width: 100%; height: 240px; object-fit: cover; display: block; }
   .media-placeholder { position: absolute; inset: 0; display: flex; align-items: center;
@@ -1457,9 +1638,69 @@ HTML_TEMPLATE = """
   .legend-bar { flex: 1; height: 8px; border-radius: 4px;
                 background: linear-gradient(90deg, #000004, #420a68, #932667, #dd513a, #fca50a, #fcffa4); }
 
+  .prototype-notice { padding: 13px 16px; margin-bottom: 18px; border: 1px solid rgba(210,153,34,0.35);
+                      border-radius: 10px; background: rgba(210,153,34,0.08); color: var(--warn); line-height: 1.5; }
+  .overview-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 18px; }
+  .overview-stat, .map-card, .selected-node-card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; }
+  .overview-stat { padding: 16px; min-width: 0; }
+  .overview-stat-label, .overview-stat-detail { color: var(--muted); font-size: 11px; }
+  .overview-stat-value { font-size: 20px; font-weight: 650; margin: 8px 0 4px; overflow-wrap: anywhere; }
+  .overview-stat-value.warn { color: var(--warn); }
+  .overview-stat-value.danger { color: var(--danger); }
+  .map-card { padding: 16px; margin-bottom: 18px; }
+  .map-header, .selected-node-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .floor-switcher, .media-switcher { display: flex; gap: 8px; flex-wrap: wrap; }
+  .floor-switch, .media-switch { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;
+                                  color: var(--muted); background: var(--surface2); cursor: pointer; }
+  .floor-switch.active, .media-switch.active { border-color: var(--accent); color: var(--text); }
+  .floor-plan { display: none; }
+  .floor-plan.active { display: block; }
+  .map-stage { position: relative; overflow: hidden; border-radius: 8px; background: #fff; line-height: 0; }
+  .map-image { display: block; width: 100%; height: auto; }
+  .map-node-marker { position: absolute; z-index: 2; transform: translate(-50%, -50%); display: grid; gap: 2px;
+                     min-width: 74px; padding: 6px 9px; border: 2px solid #536274; border-radius: 10px;
+                     background: rgba(22,26,33,0.95); color: var(--text); text-align: center; line-height: 1.2;
+                     cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.28); }
+  .map-node-marker.edge-left { transform: translate(0, -50%); }
+  .map-node-marker.edge-right { transform: translate(-100%, -50%); }
+  .map-node-marker:hover, .map-node-marker:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .map-node-marker.online { border-color: var(--success); }
+  .map-node-marker.stale { border-color: var(--warn); }
+  .map-node-marker.offline { border-color: #536274; }
+  .map-node-marker.blocked { border-color: var(--danger); }
+  .map-node-number { font-weight: 700; font-size: 12px; }
+  .map-node-state { font-size: 9px; color: #d7dce3; }
+  .map-note { color: var(--muted); font-size: 11px; margin-top: 10px; }
+  .selected-node-card { padding: 18px; }
+  .selected-node-subtitle { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .selected-node-details { display: flex; flex-wrap: wrap; gap: 8px 18px; color: var(--muted); font-size: 11px; }
+  .selected-node-details strong { color: var(--text); font-weight: 500; }
+  .overview-data-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px;
+                         background: var(--border); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin: 14px 0; }
+  .overview-data { padding: 12px; background: var(--surface); text-align: center; }
+  .overview-data-value { font: 600 17px 'JetBrains Mono', monospace; }
+  .overview-data-label { color: var(--muted); font-size: 10px; margin-top: 4px; }
+  .overview-media { position: relative; min-height: 220px; background: #05070a; border-radius: 10px; overflow: hidden; margin-top: 12px; }
+  .overview-media img { display: block; width: 100%; max-height: 440px; object-fit: contain; margin: 0 auto; }
+  .overview-media-placeholder { position: absolute; inset: 0; min-height: 220px; display: flex; align-items: center;
+                                justify-content: center; color: var(--muted); text-align: center; padding: 18px; }
+  .overview-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; }
+  .overview-controls select, .threshold-form input { padding: 9px 11px; background: var(--surface2); color: var(--text);
+                                                    border: 1px solid var(--border); border-radius: 7px; }
+  .threshold-form { margin-top: 18px; }
+  .threshold-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+  .threshold-help { color: var(--muted); font-size: 11px; line-height: 1.5; margin-bottom: 12px; }
+  .node-version { color: var(--muted); font-size: 10px; margin-top: 3px; }
+
   @media (max-width: 600px) {
     .broadcast-bar { flex-direction: column; align-items: flex-start; }
-    .settings-grid, .settings-fields { grid-template-columns: 1fr; }
+    .settings-grid, .settings-fields, .threshold-grid { grid-template-columns: 1fr; }
+    .overview-summary { grid-template-columns: 1fr; }
+    .overview-data-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .map-card { padding: 10px; }
+    .map-node-marker { min-width: 54px; padding: 4px 5px; }
+    .map-node-state { font-size: 8px; }
+    .map-header, .selected-node-heading { align-items: flex-start; flex-direction: column; }
     header { flex-direction: column; gap: 12px; align-items: flex-start; }
     .devices-table-header, .device-row { grid-template-columns: 120px 1fr 80px 80px; }
     .device-mac { display: none; }
@@ -1502,15 +1743,122 @@ HTML_TEMPLATE = """
   </header>
 
   <div class="tabs">
-    <button class="tab-btn active" onclick="switchTab('nodes',   this)"><svg class="icon"><use href="#i-cpu"/></svg>Nodes</button>
+    <button class="tab-btn active" onclick="switchTab('overview', this)"><svg class="icon"><use href="#i-shield"/></svg>Overview</button>
+    <button class="tab-btn"        onclick="switchTab('nodes',   this)"><svg class="icon"><use href="#i-cpu"/></svg>Nodes</button>
     <button class="tab-btn"        onclick="switchTab('cameras', this)"><svg class="icon"><use href="#i-camera"/></svg>Cameras</button>
     <button class="tab-btn"        onclick="switchTab('thermal', this)"><svg class="icon"><use href="#i-flame"/></svg>Thermal</button>
     <button class="tab-btn"        onclick="switchTab('devices', this)"><svg class="icon"><use href="#i-list"/></svg>Devices</button>
     <button class="tab-btn"        onclick="switchTab('settings', this)">Settings</button>
   </div>
 
+  <!-- TAB: EVACUATION OVERVIEW -->
+  <div class="tab-panel active" id="tab-overview">
+    <div class="prototype-notice">
+      <strong>Prototype guidance:</strong> automatic signs are based on the existing temperature/blockage rules.
+      They do not calculate or validate an evacuation route. Follow approved site procedures.
+    </div>
+    <div class="overview-summary" aria-live="polite">
+      <section class="overview-stat">
+        <div class="overview-stat-label">Hottest live thermal area</div>
+        <div class="overview-stat-value" id="summary-hotspot-value">No live thermal data</div>
+        <div class="overview-stat-detail" id="summary-hotspot-detail">MLX90640 hotspot · thresholds not configured</div>
+      </section>
+      <section class="overview-stat">
+        <div class="overview-stat-label">Node connectivity</div>
+        <div class="overview-stat-value" id="summary-health-value">Checking nodes…</div>
+        <div class="overview-stat-detail" id="summary-health-detail">Stale readings are not treated as live.</div>
+      </section>
+      <section class="overview-stat">
+        <div class="overview-stat-label">Reported blocked areas</div>
+        <div class="overview-stat-value" id="summary-blocked-value">--</div>
+        <div class="overview-stat-detail" id="summary-blocked-detail">From configured node/camera sensors.</div>
+      </section>
+    </div>
+
+    <section class="map-card">
+      <div class="map-header">
+        <div>
+          <h2>Building map</h2>
+          <p class="selected-node-subtitle">Select a node marker to inspect its live details.</p>
+        </div>
+        <div class="floor-switcher" role="tablist" aria-label="Select floor">
+          <button type="button" class="floor-switch active" data-floor="1" onclick="selectFloor(1, this)">Floor 1 · Ground</button>
+          <button type="button" class="floor-switch" data-floor="2" onclick="selectFloor(2, this)">Floor 2</button>
+        </div>
+      </div>
+      <div class="floor-plan active" id="floor-plan-1">
+        <div class="map-stage">
+          <img class="map-image" src="/static/maps/floor-1.png" alt="Floor 1 ground floor schematic for CDM Building 2">
+          {% for marker in floor_map_nodes if marker.floor == 1 %}
+          <button type="button" class="map-node-marker offline {% if marker.edge %}edge-{{ marker.edge }}{% endif %}" data-node-id="{{ marker.id }}"
+                  style="left:{{ marker.left }}%;top:{{ marker.top }}%"
+                  aria-label="Select Node {{ marker.label }}, {{ marker.area }}">
+            <span class="map-node-number">Node {{ marker.label }}</span>
+            <span class="map-node-state">Loading</span>
+          </button>
+          {% endfor %}
+        </div>
+        <p class="map-note">Schematic, not to scale. The displayed node links are not validated route recommendations.</p>
+      </div>
+      <div class="floor-plan" id="floor-plan-2">
+        <div class="map-stage">
+          <img class="map-image" src="/static/maps/floor-2.png" alt="Floor 2 schematic for CDM Building 2">
+          {% for marker in floor_map_nodes if marker.floor == 2 %}
+          <button type="button" class="map-node-marker offline {% if marker.edge %}edge-{{ marker.edge }}{% endif %}" data-node-id="{{ marker.id }}"
+                  style="left:{{ marker.left }}%;top:{{ marker.top }}%"
+                  aria-label="Select Node {{ marker.label }}, {{ marker.area }}">
+            <span class="map-node-number">Node {{ marker.label }}</span>
+            <span class="map-node-state">Loading</span>
+          </button>
+          {% endfor %}
+        </div>
+        <p class="map-note">Schematic, not to scale. The displayed node links are not validated route recommendations.</p>
+      </div>
+    </section>
+
+    <section class="selected-node-card" aria-live="polite">
+      <div class="selected-node-heading">
+        <div>
+          <h2 id="selected-node-name">Node 11 - Floor 1 left end</h2>
+          <p class="selected-node-subtitle" id="selected-node-status">Waiting for node data</p>
+        </div>
+        <div class="selected-node-details">
+          <span>ID: <strong id="selected-node-id">node_11</strong></span>
+          <span>IP: <strong id="selected-node-ip">--</strong></span>
+          <span>Firmware: <strong id="selected-node-firmware">--</strong></span>
+          <span>Camera: <strong id="selected-camera-info">--</strong></span>
+          <span>Last seen: <strong id="selected-node-seen">--</strong></span>
+        </div>
+      </div>
+      <div class="overview-data-grid">
+        <div class="overview-data"><div class="overview-data-value" id="selected-node-ambient">--</div><div class="overview-data-label">DHT22 ambient °C</div></div>
+        <div class="overview-data"><div class="overview-data-value" id="selected-node-humidity">--</div><div class="overview-data-label">DHT22 humidity</div></div>
+        <div class="overview-data"><div class="overview-data-value" id="selected-node-hotspot">--</div><div class="overview-data-label">MLX90640 hotspot °C</div></div>
+        <div class="overview-data"><div class="overview-data-value" id="selected-node-blocked">--</div><div class="overview-data-label">Reported blockage</div></div>
+      </div>
+      <div class="floor-switcher" role="group" aria-label="Select node camera view">
+        <button type="button" class="media-switch active" data-media="thermal" onclick="selectNodeMedia('thermal', this)">Thermal array</button>
+        <button type="button" class="media-switch" data-media="camera" onclick="selectNodeMedia('camera', this)">ESP32-CAM</button>
+      </div>
+      <div class="overview-media">
+        <img id="selected-thermal-feed" alt="Selected node MLX90640 thermal view" style="display:none">
+        <img id="selected-camera-feed" alt="Selected node ESP32-CAM view" style="display:none">
+        <div class="overview-media-placeholder" id="selected-media-placeholder">Waiting for thermal data…</div>
+      </div>
+      <div class="overview-controls">
+        <label for="selected-audio-track">Audio command</label>
+        <select id="selected-audio-track">
+          {% for track, label in sound_tracks.items() %}
+          <option value="{{ track }}">{{ label }}</option>
+          {% endfor %}
+        </select>
+        <button type="button" class="btn btn-clear btn-sm" onclick="playSelectedSound()">Play on selected node</button>
+      </div>
+    </section>
+  </div>
+
   <!-- TAB: NODES -->
-  <div class="tab-panel active" id="tab-nodes">
+  <div class="tab-panel" id="tab-nodes">
     <div class="broadcast-bar">
       <span class="broadcast-label">Broadcast All</span>
       <div class="btn-group">
@@ -1528,7 +1876,8 @@ HTML_TEMPLATE = """
         <div class="node-header">
           <div>
             <div class="node-name">{{ node.name }}</div>
-            <div class="node-ip">{{ node.ip }}:{{ node.port }}</div>
+            <div class="node-ip" id="node-ip-{{ node.id }}">{{ node.ip }}:{{ node.port }}</div>
+            <div class="node-version" id="firmware-{{ node.id }}">Firmware: --</div>
           </div>
           <div class="node-status">
             <div class="conn-dot" id="dot-{{ node.id }}"></div>
@@ -1540,13 +1889,17 @@ HTML_TEMPLATE = """
           <div class="sign-info">
             <div class="sign-label">Current Sign</div>
             <div class="sign-state OFF" id="sign-state-{{ node.id }}">OFF</div>
-            <span class="auto-badge" id="mode-badge-{{ node.id }}"><svg class="icon"><use href="#i-rotate"/></svg>AUTO</span>
+            <span class="auto-badge" id="mode-badge-{{ node.id }}"><svg class="icon"><use href="#i-rotate"/></svg>AUTO · DEMO</span>
           </div>
         </div>
         <div class="sensor-grid">
           <div class="sensor-item">
             <div class="sensor-value normal" id="temp-{{ node.id }}">--</div>
             <div class="sensor-unit">°C Temp</div>
+          </div>
+          <div class="sensor-item">
+            <div class="sensor-value normal" id="humidity-{{ node.id }}">--</div>
+            <div class="sensor-unit">% Humidity</div>
           </div>
           <div class="sensor-item">
             <div class="sensor-value normal" id="blocked-{{ node.id }}">--</div>
@@ -1682,6 +2035,35 @@ HTML_TEMPLATE = """
           <div class="settings-status" id="camera-add-status" role="status" aria-live="polite"></div>
         </form>
       </section>
+      <section class="settings-card threshold-form">
+        <h3>Site temperature alerts</h3>
+        <p class="threshold-help">
+          Set thresholds approved for this site. These classify displayed readings only; they do not choose an evacuation route
+          or change the prototype automatic sign rules. Leave a pair blank until validated.
+        </p>
+        <form id="threshold-form" class="settings-form">
+          <div class="threshold-grid">
+            <label class="settings-field">Ambient warning °C
+              <input name="ambient_warning_c" type="number" step="0.1" min="-40" max="100"
+                     value="{{ alert_thresholds.ambient_warning_c if alert_thresholds.ambient_warning_c is not none else '' }}">
+            </label>
+            <label class="settings-field">Ambient critical °C
+              <input name="ambient_critical_c" type="number" step="0.1" min="-40" max="100"
+                     value="{{ alert_thresholds.ambient_critical_c if alert_thresholds.ambient_critical_c is not none else '' }}">
+            </label>
+            <label class="settings-field">Thermal warning °C
+              <input name="thermal_warning_c" type="number" step="0.1" min="-40" max="300"
+                     value="{{ alert_thresholds.thermal_warning_c if alert_thresholds.thermal_warning_c is not none else '' }}">
+            </label>
+            <label class="settings-field">Thermal critical °C
+              <input name="thermal_critical_c" type="number" step="0.1" min="-40" max="300"
+                     value="{{ alert_thresholds.thermal_critical_c if alert_thresholds.thermal_critical_c is not none else '' }}">
+            </label>
+          </div>
+          <button class="btn btn-clear" type="submit">Save thresholds</button>
+          <div class="settings-status" id="threshold-status" role="status" aria-live="polite"></div>
+        </form>
+      </section>
     </div>
   </div>
 
@@ -1694,6 +2076,12 @@ HTML_TEMPLATE = """
   const escapeHtml = value => String(value).replace(/[&<>"']/g, character => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[character]));
+  const MAP_NODE_IDS = ['node_11', 'node_12', 'node_21', 'node_22', 'node_23'];
+  let alertThresholds = {{ alert_thresholds | tojson }};
+  const overviewNodes = {};
+  const overviewCameras = [];
+  let selectedNodeId = 'node_11';
+  let selectedMedia = 'thermal';
 
   // ── TABS ───────────────────────────────────
   function switchTab(name, btn) {
@@ -1701,6 +2089,39 @@ HTML_TEMPLATE = """
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
     document.getElementById('tab-' + name).classList.add('active');
     btn.classList.add('active');
+  }
+
+  function selectFloor(floor, button) {
+    document.querySelectorAll('.floor-switch').forEach(item => item.classList.remove('active'));
+    document.querySelectorAll('.floor-plan').forEach(item => item.classList.remove('active'));
+    button.classList.add('active');
+    document.getElementById(`floor-plan-${floor}`).classList.add('active');
+  }
+
+  function selectOverviewNode(nodeId) {
+    stopOverviewStreams();
+    selectedNodeId = nodeId;
+    renderSelectedNode();
+  }
+
+  function selectNodeMedia(media, button) {
+    stopOverviewStreams();
+    selectedMedia = media;
+    document.querySelectorAll('.media-switch').forEach(item => item.classList.remove('active'));
+    button.classList.add('active');
+    renderSelectedMedia();
+  }
+
+  function stopOverviewStreams() {
+    [document.getElementById('selected-thermal-feed'),
+     document.getElementById('selected-camera-feed')].forEach(image => {
+      image.onload = null;
+      image.onerror = null;
+      image.removeAttribute('src');
+      delete image.dataset.source;
+      delete image.dataset.failed;
+      delete image.dataset.loaded;
+    });
   }
 
   // ── SOCKET ─────────────────────────────────
@@ -1711,9 +2132,93 @@ HTML_TEMPLATE = """
   socket.on('camera_update',  cam     => updateCameraCard(cam));
   socket.on('cameras_changed', () => window.location.reload());
   socket.on('devices_update', devices => renderDevices(devices));
+  socket.on('thresholds_update', thresholds => {
+    alertThresholds = thresholds;
+    renderOverview();
+  });
+
+  document.querySelectorAll('.map-node-marker').forEach(marker => {
+    marker.addEventListener('click', () => selectOverviewNode(marker.dataset.nodeId));
+  });
+  registerSettingsForm(
+    'threshold-form',
+    '/api/settings/thresholds',
+    ['ambient_warning_c', 'ambient_critical_c', 'thermal_warning_c', 'thermal_critical_c'],
+    'threshold-status'
+  );
+  window.setInterval(renderOverview, 1000);
+  Promise.all([
+    fetch('/api/nodes').then(response => {
+      if (!response.ok) throw new Error('Could not load nodes');
+      return response.json();
+    }),
+    fetch('/api/cameras').then(response => {
+      if (!response.ok) throw new Error('Could not load cameras');
+      return response.json();
+    }),
+    fetch('/api/settings/thresholds').then(response => {
+      if (!response.ok) throw new Error('Could not load alert thresholds');
+      return response.json();
+    })
+  ]).then(([nodes, cameras, thresholds]) => {
+    alertThresholds = thresholds;
+    nodes.forEach(updateNodeCard);
+    cameras.forEach(updateCameraCard);
+    renderOverview();
+  }).catch(error => addLog(`Overview data error: ${error.message}`, 'err'));
 
   // ── NODE CARDS ─────────────────────────────
+  function nodeFreshness(node) {
+    if (!node) return 'unregistered';
+    if (!node.connected) return 'offline';
+    const ageAtReceipt = Number(node.last_seen_age_seconds);
+    const ageNow = Number.isFinite(ageAtReceipt)
+      ? ageAtReceipt + (Date.now() - node.__receivedAt) / 1000
+      : Infinity;
+    if (node.stale || !node.__receivedAt || ageNow > 5) return 'stale';
+    return 'online';
+  }
+
+  function cameraFreshness(camera) {
+    if (!camera) return 'unregistered';
+    if (!camera.enabled) return 'disabled';
+    const ageAtReceipt = Number(camera.last_seen_age_seconds);
+    const ageNow = Number.isFinite(ageAtReceipt)
+      ? ageAtReceipt + (Date.now() - camera.__receivedAt) / 1000
+      : Infinity;
+    return camera.stale || !camera.__receivedAt || ageNow > 5 ? 'stale' : 'online';
+  }
+
+  function updateCameraStatus(camera) {
+    const statusEl = document.getElementById(`cam-status-${camera.id}`);
+    const card = document.getElementById(`cam-card-${camera.id}`);
+    if (!statusEl) return;
+    const freshness = cameraFreshness(camera);
+    const isBlocked = freshness === 'online' && camera.blocked;
+    statusEl.className = isBlocked ? 'blocked-badge' :
+      freshness === 'online' ? 'clear-badge' :
+      freshness === 'stale' ? 'stale-badge' : 'disabled-badge';
+    statusEl.textContent = isBlocked ? 'BLOCKED' :
+      freshness === 'online' ? 'CLEAR' :
+      freshness === 'stale' ? 'STALE' : 'DISABLED';
+    if (card) card.classList.toggle('blocked-active', isBlocked);
+    if (card) card.classList.toggle('camera-stale', freshness !== 'online');
+  }
+
+  function sensorSeverity(value, kind) {
+    if (value == null) return 'normal';
+    const warning = alertThresholds[`${kind}_warning_c`];
+    const critical = alertThresholds[`${kind}_critical_c`];
+    if (critical != null && value >= critical) return 'danger';
+    if (warning != null && value >= warning) return 'warn';
+    return 'normal';
+  }
+
   function updateNodeCard(node) {
+    node.__receivedAt = Date.now();
+    overviewNodes[node.id] = node;
+    renderOverview();
+
     const card      = document.getElementById(`card-${node.id}`);
     const dot       = document.getElementById(`dot-${node.id}`);
     const connLabel = document.getElementById(`conn-label-${node.id}`);
@@ -1721,13 +2226,18 @@ HTML_TEMPLATE = """
     const signState = document.getElementById(`sign-state-${node.id}`);
     const modeBadge = document.getElementById(`mode-badge-${node.id}`);
     const tempEl    = document.getElementById(`temp-${node.id}`);
+    const humidityEl = document.getElementById(`humidity-${node.id}`);
     const blockedEl = document.getElementById(`blocked-${node.id}`);
     const lastSeen  = document.getElementById(`lastseen-${node.id}`);
+    const firmwareEl = document.getElementById(`firmware-${node.id}`);
+    const ipEl = document.getElementById(`node-ip-${node.id}`);
     if (!card) return;
 
-    dot.classList.toggle('online', node.connected);
-    connLabel.textContent = node.connected ? 'ONLINE' : 'OFFLINE';
-    card.classList.toggle('connected', node.connected);
+    const freshness = nodeFreshness(node);
+    dot.classList.toggle('online', freshness === 'online');
+    connLabel.textContent = freshness.toUpperCase();
+    card.classList.toggle('connected', freshness === 'online');
+    card.classList.toggle('stale', freshness === 'stale');
 
     const sign = node.current_sign || 'OFF';
     signIcon.className   = `sign-icon ${sign}`;
@@ -1739,24 +2249,241 @@ HTML_TEMPLATE = """
     modeBadge.className   = node.override ? 'override-badge' : 'auto-badge';
     modeBadge.innerHTML   = node.override
       ? svgIcon('i-alert') + 'OVERRIDE'
-      : svgIcon('i-rotate') + 'AUTO';
+      : svgIcon('i-rotate') + 'AUTO · DEMO';
 
     if (node.temperature != null) {
-      const t = parseFloat(node.temperature).toFixed(1);
-      tempEl.textContent = t;
-      tempEl.className = 'sensor-value ' + (t > 50 ? 'danger' : t > 35 ? 'warn' : 'normal');
+      tempEl.textContent = parseFloat(node.temperature).toFixed(1);
+      tempEl.className = `sensor-value ${sensorSeverity(node.temperature, 'ambient')}`;
+    } else {
+      tempEl.textContent = '--';
+      tempEl.className = 'sensor-value normal';
+    }
+    if (humidityEl) {
+      humidityEl.textContent = node.humidity == null ? '--' : `${parseFloat(node.humidity).toFixed(1)}`;
     }
     if (node.blocked != null) {
       blockedEl.textContent = node.blocked ? 'YES' : 'NO';
       blockedEl.className   = 'sensor-value ' + (node.blocked ? 'danger' : 'normal');
     }
     if (node.last_seen) lastSeen.textContent = node.last_seen;
+    if (firmwareEl) firmwareEl.textContent = `Firmware: ${node.firmware_version || '--'}`;
+    if (ipEl) ipEl.textContent = `${node.ip || 'DHCP'}:${node.port || 5001}`;
 
     updateThermalCard(node);
   }
 
+  const MAP_NODE_AREAS = {
+    node_11: 'Floor 1 · Left end',
+    node_12: 'Floor 1 · Right end',
+    node_21: 'Floor 2 · Left end',
+    node_22: 'Floor 2 · Middle',
+    node_23: 'Floor 2 · Right end'
+  };
+
+  function renderOverview() {
+    const mappedNodes = MAP_NODE_IDS.map(id => overviewNodes[id]).filter(Boolean);
+    let online = 0;
+    let stale = 0;
+    let offline = MAP_NODE_IDS.length - mappedNodes.length;
+    const blocked = [];
+
+    document.querySelectorAll('.map-node-marker').forEach(marker => {
+      const node = overviewNodes[marker.dataset.nodeId];
+      const freshness = nodeFreshness(node);
+      const cameraBlocked = overviewCameras.some(camera =>
+        camera.node_id === marker.dataset.nodeId &&
+        cameraFreshness(camera) === 'online' &&
+        camera.blocked
+      );
+      const nodeBlocked = freshness === 'online' && node.blocked;
+      marker.classList.remove('online', 'stale', 'offline', 'blocked');
+      marker.classList.add(freshness === 'unregistered' ? 'offline' : freshness);
+      if (cameraBlocked || nodeBlocked) marker.classList.add('blocked');
+      if (freshness === 'online') online++;
+      else if (freshness === 'stale') stale++;
+      else if (freshness === 'offline') offline++;
+      if (cameraBlocked || nodeBlocked) {
+        blocked.push(MAP_NODE_AREAS[marker.dataset.nodeId]);
+      }
+      marker.querySelector('.map-node-state').textContent =
+        freshness === 'unregistered' ? 'Not registered' :
+        cameraBlocked || nodeBlocked ? 'Blocked' :
+        freshness === 'stale' ? 'Stale data' :
+        freshness === 'online' ? 'Online' : 'Offline';
+    });
+    overviewCameras.forEach(updateCameraStatus);
+    Object.values(overviewNodes).forEach(node => {
+      if (document.getElementById(`t-status-${node.id}`)) updateThermalStatus(node);
+    });
+
+    const liveThermalNodes = MAP_NODE_IDS
+      .map(id => overviewNodes[id])
+      .filter(node => node && nodeFreshness(node) === 'online' && node.thermal_max != null);
+    liveThermalNodes.sort((a, b) => b.thermal_max - a.thermal_max);
+    const hotspotValue = document.getElementById('summary-hotspot-value');
+    const hotspotDetail = document.getElementById('summary-hotspot-detail');
+    hotspotValue.className = 'overview-stat-value';
+    if (liveThermalNodes.length) {
+      const hottest = liveThermalNodes[0];
+      const severity = sensorSeverity(hottest.thermal_max, 'thermal');
+      const thresholdsConfigured = alertThresholds.thermal_warning_c != null;
+      hotspotValue.textContent = `${MAP_NODE_AREAS[hottest.id]} · ${Number(hottest.thermal_max).toFixed(1)} °C`;
+      hotspotValue.classList.add(severity);
+      hotspotDetail.textContent = `MLX90640 hotspot at ${hottest.thermal_last || 'latest frame'} · ${
+        thresholdsConfigured ? (severity === 'normal' ? 'Below warning threshold' : severity.toUpperCase()) : 'No thermal thresholds configured'
+      }`;
+    } else {
+      hotspotValue.textContent = 'No live thermal data';
+      hotspotDetail.textContent = 'Offline, stale, or not-yet-reported thermal data is excluded.';
+    }
+
+    document.getElementById('summary-health-value').textContent =
+      `${online} online · ${stale} stale · ${offline} offline`;
+    document.getElementById('summary-health-detail').textContent =
+      `${mappedNodes.length} of ${MAP_NODE_IDS.length} map nodes registered; stale/offline data is not treated as live.`;
+    document.getElementById('summary-blocked-value').textContent =
+      blocked.length ? `${blocked.length} reported` : 'None reported';
+    document.getElementById('summary-blocked-detail').textContent =
+      blocked.length ? blocked.join(' · ') : 'Offline or stale areas have unknown status.';
+
+    renderSelectedNode();
+  }
+
+  function renderSelectedNode() {
+    const node = overviewNodes[selectedNodeId];
+    const freshness = nodeFreshness(node);
+    const area = MAP_NODE_AREAS[selectedNodeId] || 'Unmapped node';
+    document.getElementById('selected-node-name').textContent =
+      node ? node.name : `Node ${selectedNodeId.replace('node_', '')}`;
+    document.getElementById('selected-node-status').textContent =
+      freshness === 'online' ? `${area} · ONLINE` :
+      freshness === 'stale' ? `${area} · STALE DATA — readings may be outdated` :
+      freshness === 'offline' ? `${area} · OFFLINE — last readings are not live` :
+      `${area} · NOT REGISTERED`;
+    document.getElementById('selected-node-id').textContent = selectedNodeId;
+    document.getElementById('selected-node-ip').textContent = node ? `${node.ip || 'DHCP'}:${node.port || 5001}` : '--';
+    document.getElementById('selected-node-firmware').textContent = node?.firmware_version || '--';
+    const camera = overviewCameras.find(item => item.node_id === selectedNodeId);
+    document.getElementById('selected-camera-info').textContent =
+      camera ? `${camera.id} · ${camera.ip || 'IP unknown'}${camera.enabled ? '' : ' · disabled'}` : 'None registered';
+    document.getElementById('selected-node-seen').textContent = node?.last_seen || '--';
+    document.getElementById('selected-node-ambient').textContent =
+      node?.temperature == null ? '--' : `${Number(node.temperature).toFixed(1)} °C`;
+    document.getElementById('selected-node-humidity').textContent =
+      node?.humidity == null ? '--' : `${Number(node.humidity).toFixed(1)} %`;
+    document.getElementById('selected-node-hotspot').textContent =
+      node?.thermal_max == null ? '--' : `${Number(node.thermal_max).toFixed(1)} °C`;
+    document.getElementById('selected-node-blocked').textContent =
+      freshness !== 'online' ? 'UNKNOWN' : node.blocked ? 'BLOCKED' : 'No blockage reported';
+    renderSelectedMedia();
+  }
+
+  function renderSelectedMedia() {
+    const thermalImage = document.getElementById('selected-thermal-feed');
+    const cameraImage = document.getElementById('selected-camera-feed');
+    const placeholder = document.getElementById('selected-media-placeholder');
+    thermalImage.style.display = 'none';
+    cameraImage.style.display = 'none';
+    placeholder.style.display = 'flex';
+
+    if (selectedMedia === 'thermal') {
+      const node = overviewNodes[selectedNodeId];
+      if (!node || !node.has_thermal) {
+        placeholder.textContent = 'No MLX90640 thermal frame received from this node yet.';
+        return;
+      }
+      if (nodeFreshness(node) !== 'online') {
+        placeholder.textContent = `Thermal feed is not live. Last frame: ${node.thermal_last || node.last_seen || 'unknown'}.`;
+        return;
+      }
+      const source = `/api/node/${encodeURIComponent(selectedNodeId)}/thermal/feed`;
+      if (thermalImage.dataset.source !== source) {
+        thermalImage.dataset.source = source;
+        thermalImage.dataset.failed = '';
+        thermalImage.dataset.loaded = '';
+        thermalImage.onerror = () => {
+          thermalImage.dataset.failed = '1';
+          thermalImage.style.display = 'none';
+          placeholder.style.display = 'flex';
+          placeholder.textContent = 'Thermal stream is unavailable.';
+        };
+        thermalImage.onload = () => {
+          thermalImage.dataset.loaded = '1';
+          placeholder.style.display = 'none';
+        };
+        thermalImage.src = source;
+      }
+      if (thermalImage.dataset.failed) {
+        placeholder.style.display = 'flex';
+        return;
+      }
+      thermalImage.style.display = thermalImage.dataset.loaded ? 'block' : 'none';
+      placeholder.style.display = thermalImage.dataset.loaded ? 'none' : 'flex';
+      placeholder.textContent = 'Connecting to the MLX90640 thermal feed…';
+      return;
+    }
+
+    const camera = overviewCameras.find(item => item.node_id === selectedNodeId && item.enabled);
+    if (!camera) {
+      placeholder.textContent = 'No enabled ESP32-CAM is registered for this node.';
+      return;
+    }
+    if (cameraFreshness(camera) !== 'online') {
+      placeholder.textContent = `ESP32-CAM is stale or offline. Last frame: ${camera.last_seen || 'unknown'}.`;
+      return;
+    }
+    const source = `/api/camera/${encodeURIComponent(camera.id)}/feed`;
+    if (cameraImage.dataset.source !== source) {
+      cameraImage.dataset.source = source;
+      cameraImage.dataset.failed = '';
+      cameraImage.dataset.loaded = '';
+      cameraImage.onerror = () => {
+        cameraImage.dataset.failed = '1';
+        cameraImage.style.display = 'none';
+        placeholder.style.display = 'flex';
+        placeholder.textContent = 'ESP32-CAM stream is unavailable.';
+      };
+      cameraImage.onload = () => {
+        cameraImage.dataset.loaded = '1';
+        placeholder.style.display = 'none';
+      };
+      cameraImage.src = source;
+    }
+    if (cameraImage.dataset.failed) {
+      placeholder.style.display = 'flex';
+      return;
+    }
+    cameraImage.style.display = cameraImage.dataset.loaded ? 'block' : 'none';
+    placeholder.style.display = cameraImage.dataset.loaded ? 'none' : 'flex';
+    placeholder.textContent = 'Connecting to the ESP32-CAM feed…';
+  }
+
+  function playSelectedSound() {
+    const track = Number(document.getElementById('selected-audio-track').value);
+    playSound(selectedNodeId, track);
+  }
+
   // ── THERMAL CARDS ──────────────────────────
   const thermalCards = {};
+
+  function updateThermalStatus(node) {
+    const status = document.getElementById(`t-status-${node.id}`);
+    const card = thermalCards[node.id];
+    if (!status || !card) return;
+    if (!node.has_thermal) {
+      status.className = 'pill';
+      status.textContent = 'No data';
+      card.classList.remove('stale-thermal');
+      return;
+    }
+
+    const freshness = nodeFreshness(node);
+    status.className = freshness === 'online' ? 'pill pill-live' :
+      freshness === 'stale' ? 'pill pill-stale' : 'pill';
+    status.textContent = freshness === 'online' ? 'Live' :
+      freshness === 'stale' ? 'Stale' : 'Offline';
+    card.classList.toggle('stale-thermal', freshness !== 'online');
+  }
 
   function updateThermalCard(node) {
     let card = thermalCards[node.id];
@@ -1789,7 +2516,6 @@ HTML_TEMPLATE = """
       thermalCards[node.id] = card;
     }
 
-    const status = document.getElementById(`t-status-${node.id}`);
     const img    = document.getElementById(`tfeed-${node.id}`);
     const ph     = document.getElementById(`tph-${node.id}`);
 
@@ -1800,8 +2526,6 @@ HTML_TEMPLATE = """
         img.onload = () => { ph.style.display = 'none'; };
       }
       ph.style.display = 'none';
-      status.className = 'pill pill-live';
-      status.textContent = 'Live';
     }
 
     const hot = document.getElementById(`t-hot-${node.id}`);
@@ -1810,12 +2534,19 @@ HTML_TEMPLATE = """
     if (node.thermal_max != null) hot.textContent = parseFloat(node.thermal_max).toFixed(1);
     if (node.thermal_min != null) min.textContent = parseFloat(node.thermal_min).toFixed(1);
     if (node.temperature != null) amb.textContent = parseFloat(node.temperature).toFixed(1);
+    updateThermalStatus(node);
   }
 
   // ── CAMERA CARDS ───────────────────────────
   const cameraCards = {};
 
   function updateCameraCard(cam) {
+    cam.__receivedAt = Date.now();
+    const cameraIndex = overviewCameras.findIndex(item => item.id === cam.id);
+    if (cameraIndex === -1) overviewCameras.push(cam);
+    else overviewCameras[cameraIndex] = cam;
+    renderOverview();
+
     const grid = document.getElementById('cameras-grid');
     const none = document.getElementById('no-cameras');
 
@@ -1860,7 +2591,7 @@ HTML_TEMPLATE = """
         </div>
       `;
       card.querySelector('.camera-name').textContent = cam.name;
-      card.querySelector('.camera-node').textContent = `Monitoring: ${cam.node_id}`;
+      card.querySelector('.camera-node').textContent = `Monitoring: ${cam.node_id} · ${cam.id}`;
       grid.appendChild(card);
       cameraCards[cam.id] = card;
       none.style.display = 'none';
@@ -1871,27 +2602,25 @@ HTML_TEMPLATE = """
     const debrisEl = document.getElementById(`cam-debris-${cam.id}`);
     const distEl   = document.getElementById(`cam-dist-${cam.id}`);
     const seenEl   = document.getElementById(`cam-seen-${cam.id}`);
-    const statusEl = document.getElementById(`cam-status-${cam.id}`);
     const errorEl  = document.getElementById(`cam-error-${cam.id}`);
     const toggleButton = card.querySelector('.toggle-cam-btn');
 
     if (toggleButton) toggleButton.textContent = cam.enabled ? 'Disable' : 'Enable';
+    const cameraNode = card.querySelector('.camera-node');
+    if (cameraNode) cameraNode.textContent = `Monitoring: ${cam.node_id} · ${cam.id} · ${cam.ip || 'IP unknown'}`;
     if (debrisEl) debrisEl.textContent = cam.debris_count ?? '--';
     if (distEl)   distEl.textContent   = cam.closest_debris ? `${cam.closest_debris}` : '--';
     if (seenEl)   seenEl.textContent   = cam.last_seen ?? '--';
 
-    if (statusEl) {
-      statusEl.className   = cam.blocked ? 'blocked-badge' : 'clear-badge';
-      statusEl.innerHTML   = cam.blocked ? svgIcon('i-alert') + 'BLOCKED' : svgIcon('i-check') + 'CLEAR';
-    }
-
     if (errorEl) errorEl.textContent = cam.error ?? '';
 
-    card.classList.toggle('blocked-active', cam.blocked);
+    updateCameraStatus(cam);
 
-    if (cam.blocked) {
+    const currentlyBlocked = cameraFreshness(cam) === 'online' && cam.blocked;
+    if (currentlyBlocked && !cam.__loggedBlocked) {
       addLog(`Camera ${cam.name} detected blockage -> Node ${cam.node_id} set to STOP`, 'cam');
     }
+    cam.__loggedBlocked = currentlyBlocked;
   }
 
   function toggleCamera(camId) {

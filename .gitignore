@@ -25,6 +25,7 @@ env/
 build/
 *.ino.bin
 *.ino.hex
+ESP_Node/GAKUNA_ESP_NODE/wifi_secrets.h
 
 # ─── ML-Agents training ────────────────────────
 TrainerConfig/results/*/Evacuationer/events.out.tfevents.*
