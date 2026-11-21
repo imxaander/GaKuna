@@ -1819,12 +1819,25 @@ HTML_TEMPLATE = """
   .overview-other-nodes { grid-column: 1; display: none; }
 
   /* LAYOUT B: Compact side-by-side (3D model left, selected node info right) */
-  #overview-container.layout-b .map-card { grid-column: 1; grid-row: 1; overflow: hidden; display: flex; flex-direction: column; }
-  #overview-container.layout-b .selected-node-card { grid-column: 2; grid-row: 1; }
+  #overview-container.layout-b .map-card { 
+    grid-column: 1; 
+    grid-row: 1; 
+    overflow: auto; 
+    display: flex; 
+    flex-direction: column; 
+    min-width: 0;
+    max-width: 100%;
+  }
+  #overview-container.layout-b .selected-node-card { 
+    grid-column: 2; 
+    grid-row: 1;
+    min-width: 0;
+  }
   #overview-container.layout-b .overview-other-nodes { display: none; }
   
-  #overview-container.layout-b .map-card .building-model-viewport { max-height: 500px; }
   #overview-container.layout-b .map-card .model-node-list { display: none; }
+  #overview-container.layout-b .map-card .building-model-viewport { max-height: 500px; }
+  #overview-container.layout-b .map-card #building-model-canvas { height: auto; max-height: 500px; }
 
   .overview-other-nodes { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; padding: 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; }
   .overview-other-nodes-title { grid-column: 1 / -1; font-size: 12px; font-weight: 600; color: var(--text); letter-spacing: 0.5px; margin-bottom: 2px; }
