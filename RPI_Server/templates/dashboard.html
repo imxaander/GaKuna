@@ -1441,18 +1441,21 @@
   }
 
   function buildingBoxFaces(box, layout) {
-    const points = (coords, color) => {
+    const points = (coords, color, forceKind) => {
       const projected = coords.map(([x, y, z]) => projectBuildingPoint(x, y, z, layout));
       const depth = coords.reduce((sum, [x, y, z]) =>
         sum + (x * layout.sinYaw + y * layout.cosYaw) * layout.cosElevation +
           z * layout.sinElevation, 0) / coords.length;
+      const zCoords = coords.map(c => c[2]);
       return {
         points: projected,
         color,
         depth,
         floor: box.floor,
-        kind: box.kind,
-        z: (Math.min(...coords.map(c => c[2])) + Math.max(...coords.map(c => c[2]))) / 2,
+        kind: forceKind || box.kind,
+        z: (Math.min(...zCoords) + Math.max(...zCoords)) / 2,
+        zMin: Math.min(...zCoords),
+        zMax: Math.max(...zCoords),
         stroke: box.colors.stroke,
         opacity: buildingView.level === 'both' && buildingView.cutaway && box.floor === 2 ? 0.32 : 1
       };
@@ -1460,20 +1463,23 @@
     const xSide = layout.sinYaw > 0 ? box.x2 : box.x1;
     const ySide = layout.cosYaw > 0 ? box.y2 : box.y1;
     const faces = [];
+    
+    // Always render top face, but mark slab tops as 'slab' kind for sorting priority
+    faces.push(points([
+      [box.x1, box.y1, box.z2], [box.x2, box.y1, box.z2],
+      [box.x2, box.y2, box.z2], [box.x1, box.y2, box.z2]
+    ], box.colors.top, 'slab'));
+    
     if (box.kind !== 'slab') {
       faces.push(points([
-        [box.x1, box.y1, box.z2], [box.x2, box.y1, box.z2],
-        [box.x2, box.y2, box.z2], [box.x1, box.y2, box.z2]
-      ], box.colors.top));
+        [xSide, box.y1, box.z1], [xSide, box.y2, box.z1],
+        [xSide, box.y2, box.z2], [xSide, box.y1, box.z2]
+      ], box.colors.x));
+      faces.push(points([
+        [box.x1, ySide, box.z1], [box.x2, ySide, box.z1],
+        [box.x2, ySide, box.z2], [box.x1, ySide, box.z2]
+      ], box.colors.y));
     }
-    faces.push(points([
-      [xSide, box.y1, box.z1], [xSide, box.y2, box.z1],
-      [xSide, box.y2, box.z2], [xSide, box.y1, box.z2]
-    ], box.colors.x));
-    faces.push(points([
-      [box.x1, ySide, box.z1], [box.x2, ySide, box.z1],
-      [box.x2, ySide, box.z2], [box.x1, ySide, box.z2]
-    ], box.colors.y));
     return faces;
   }
 
@@ -1540,13 +1546,16 @@
     faces.sort((left, right) => {
       // Primary sort: by floor (lower floor first)
       if (left.floor !== right.floor) return left.floor - right.floor;
-      // Secondary sort: by z-coordinate within the same floor
-      if (Math.abs(left.z - right.z) > 0.01) return left.z - right.z;
-      // Tertiary sort: within same z-height, slabs render before other objects
+      
+      // Secondary sort: Slabs on the same floor ALWAYS render before non-slab objects
       const leftIsSlab = left.kind === 'slab' ? 0 : 1;
       const rightIsSlab = right.kind === 'slab' ? 0 : 1;
       if (leftIsSlab !== rightIsSlab) return leftIsSlab - rightIsSlab;
-      // Quaternary sort: by depth (isometric distance)
+      
+      // Tertiary sort: Within same kind, sort by z-coordinate (bottom to top)
+      if (Math.abs(left.z - right.z) > 0.01) return left.z - right.z;
+      
+      // Quaternary sort: by depth (isometric distance for final ordering)
       return left.depth - right.depth;
     });
     faces.forEach(face => {
