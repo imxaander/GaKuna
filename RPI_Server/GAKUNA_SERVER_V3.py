@@ -1800,6 +1800,46 @@ HTML_TEMPLATE = """
   .threshold-help { color: var(--muted); font-size: 11px; line-height: 1.5; margin-bottom: 12px; }
   .node-version { color: var(--muted); font-size: 10px; margin-top: 3px; }
 
+  /* ══════════════════════════════════════════════
+     LAYOUT SWITCHING
+     ══════════════════════════════════════════════ */
+  .layout-toggle { display: inline-flex; align-items: center; gap: 10px; font-size: 11px; color: var(--muted); }
+  .layout-toggle-btn { padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface2);
+                       color: var(--muted); cursor: pointer; transition: all 0.2s; }
+  .layout-toggle-btn.active { border-color: var(--accent); color: var(--text); }
+  .layout-toggle-btn:hover { border-color: var(--accent); }
+
+  /* LAYOUT A: Classic (default) */
+  #overview-container { display: grid; grid-template-columns: 1fr; gap: 18px; }
+  #overview-container.layout-b { grid-template-columns: 1fr 1fr; gap: 14px; }
+
+  .map-card { grid-column: 1; }
+  .selected-node-card { grid-column: 1; }
+  .overview-other-nodes { grid-column: 1; display: none; }
+
+  /* LAYOUT B: Side-by-side with other nodes */
+  #overview-container.layout-b .map-card { grid-column: 1; grid-row: 1 / 3; }
+  #overview-container.layout-b .selected-node-card { grid-column: 2; grid-row: 1; }
+  #overview-container.layout-b .overview-other-nodes { grid-column: 2; grid-row: 2; display: grid; }
+
+  .overview-other-nodes { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; padding: 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; }
+  .overview-other-nodes-title { grid-column: 1 / -1; font-size: 12px; font-weight: 600; color: var(--text); letter-spacing: 0.5px; margin-bottom: 2px; }
+  .node-preview-card { background: var(--surface2); border: 1px solid var(--border); border-radius: 10px; padding: 11px; display: flex; flex-direction: column; gap: 8px; cursor: pointer; transition: all 0.2s; }
+  .node-preview-card:hover { border-color: var(--accent); }
+  .node-preview-card.selected { border-color: var(--accent); background: rgba(76,141,255,0.08); }
+  .node-preview-name { font-size: 11px; font-weight: 600; color: var(--text); }
+  .node-preview-status { font-size: 10px; color: var(--muted); }
+  .node-preview-sensors { display: flex; flex-direction: column; gap: 4px; font-size: 10px; }
+  .node-preview-sensor { display: flex; justify-content: space-between; align-items: center; }
+  .node-preview-sensor-label { color: var(--muted); }
+  .node-preview-sensor-value { color: var(--accent); font-family: 'JetBrains Mono', monospace; font-size: 9px; }
+  .node-preview-sensor-value.warn { color: var(--warn); }
+  .node-preview-sensor-value.danger { color: var(--danger); }
+  .node-preview-media-toggle { display: flex; gap: 4px; }
+  .node-preview-media-btn { flex: 1; padding: 4px 6px; font-size: 9px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--muted); cursor: pointer; transition: all 0.2s; }
+  .node-preview-media-btn.active { border-color: var(--accent); color: var(--accent); }
+  .node-preview-media-btn:hover { border-color: var(--accent); }
+
   @media (max-width: 600px) {
     .broadcast-bar { flex-direction: column; align-items: flex-start; }
     .settings-grid, .settings-fields, .threshold-grid { grid-template-columns: 1fr; }
@@ -1813,6 +1853,9 @@ HTML_TEMPLATE = """
     header { flex-direction: column; gap: 12px; align-items: flex-start; }
     .devices-table-header, .device-row { grid-template-columns: 120px 1fr 80px 80px; }
     .device-mac { display: none; }
+    #overview-container.layout-b { grid-template-columns: 1fr; }
+    #overview-container.layout-b .map-card, #overview-container.layout-b .selected-node-card, #overview-container.layout-b .overview-other-nodes { grid-column: auto; grid-row: auto; }
+    .layout-toggle { flex-direction: column; align-items: flex-start; }
   }
 </style>
 </head>
@@ -1890,10 +1933,17 @@ HTML_TEMPLATE = """
           <h2>Interactive 3D building model</h2>
           <p class="selected-node-subtitle">Select a node in the model or list to inspect its live details.</p>
         </div>
-        <div class="model-level-switcher" role="group" aria-label="Visible building floors">
-          <button type="button" class="model-level-btn active" aria-pressed="true" onclick="setBuildingLevel('both', this)">Both floors</button>
-          <button type="button" class="model-level-btn" aria-pressed="false" onclick="setBuildingLevel('1', this)">Floor 1</button>
-          <button type="button" class="model-level-btn" aria-pressed="false" onclick="setBuildingLevel('2', this)">Floor 2</button>
+        <div style="display: flex; align-items: center; gap: 20px;">
+          <div class="layout-toggle">
+            <span>Layout:</span>
+            <button type="button" class="layout-toggle-btn active" data-layout="a" onclick="setOverviewLayout('a', this)">Classic</button>
+            <button type="button" class="layout-toggle-btn" data-layout="b" onclick="setOverviewLayout('b', this)">Compact</button>
+          </div>
+          <div class="model-level-switcher" role="group" aria-label="Visible building floors">
+            <button type="button" class="model-level-btn active" aria-pressed="true" onclick="setBuildingLevel('both', this)">Both floors</button>
+            <button type="button" class="model-level-btn" aria-pressed="false" onclick="setBuildingLevel('1', this)">Floor 1</button>
+            <button type="button" class="model-level-btn" aria-pressed="false" onclick="setBuildingLevel('2', this)">Floor 2</button>
+          </div>
         </div>
       </div>
       <div class="model-tools">
@@ -1970,45 +2020,54 @@ HTML_TEMPLATE = """
       </details>
     </section>
 
-    <section class="selected-node-card" aria-live="polite">
-      <div class="selected-node-heading">
-        <div>
-          <h2 id="selected-node-name">Node 11 - Floor 1 left end</h2>
-          <p class="selected-node-subtitle" id="selected-node-status">Waiting for node data</p>
+    <div id="overview-container" class="layout-a">
+      <section class="selected-node-card" aria-live="polite">
+        <div class="selected-node-heading">
+          <div>
+            <h2 id="selected-node-name">Node 11 - Floor 1 left end</h2>
+            <p class="selected-node-subtitle" id="selected-node-status">Waiting for node data</p>
+          </div>
+          <div class="selected-node-details">
+            <span>ID: <strong id="selected-node-id">node_11</strong></span>
+            <span>IP: <strong id="selected-node-ip">--</strong></span>
+            <span>Firmware: <strong id="selected-node-firmware">--</strong></span>
+            <span>Camera: <strong id="selected-camera-info">--</strong></span>
+            <span>Last seen: <strong id="selected-node-seen">--</strong></span>
+          </div>
         </div>
-        <div class="selected-node-details">
-          <span>ID: <strong id="selected-node-id">node_11</strong></span>
-          <span>IP: <strong id="selected-node-ip">--</strong></span>
-          <span>Firmware: <strong id="selected-node-firmware">--</strong></span>
-          <span>Camera: <strong id="selected-camera-info">--</strong></span>
-          <span>Last seen: <strong id="selected-node-seen">--</strong></span>
+        <div class="overview-data-grid">
+          <div class="overview-data"><div class="overview-data-value" id="selected-node-ambient">--</div><div class="overview-data-label">DHT22 ambient °C</div></div>
+          <div class="overview-data"><div class="overview-data-value" id="selected-node-humidity">--</div><div class="overview-data-label">DHT22 humidity</div></div>
+          <div class="overview-data"><div class="overview-data-value" id="selected-node-hotspot">--</div><div class="overview-data-label">MLX90640 hotspot °C</div></div>
+          <div class="overview-data"><div class="overview-data-value" id="selected-node-blocked">--</div><div class="overview-data-label">Reported blockage</div></div>
+        </div>
+        <div class="floor-switcher" role="group" aria-label="Select node camera view">
+          <button type="button" class="media-switch active" data-media="thermal" onclick="selectNodeMedia('thermal', this)">Thermal array</button>
+          <button type="button" class="media-switch" data-media="camera" onclick="selectNodeMedia('camera', this)">ESP32-CAM</button>
+        </div>
+        <div class="overview-media">
+          <img id="selected-thermal-feed" alt="Selected node MLX90640 thermal view" style="display:none">
+          <img id="selected-camera-feed" alt="Selected node ESP32-CAM view" style="display:none">
+          <div class="overview-media-placeholder" id="selected-media-placeholder">Waiting for thermal data…</div>
+        </div>
+        <div class="overview-controls">
+          <label for="selected-audio-track">Audio command</label>
+          <select id="selected-audio-track">
+            {% for track, label in sound_tracks.items() %}
+            <option value="{{ track }}">{{ label }}</option>
+            {% endfor %}
+          </select>
+          <button type="button" class="btn btn-clear btn-sm" onclick="playSelectedSound()">Play on selected node</button>
+        </div>
+      </section>
+
+      <div class="overview-other-nodes">
+        <div class="overview-other-nodes-title">Other nodes</div>
+        <div id="node-previews">
+          <!-- Populated by JS -->
         </div>
       </div>
-      <div class="overview-data-grid">
-        <div class="overview-data"><div class="overview-data-value" id="selected-node-ambient">--</div><div class="overview-data-label">DHT22 ambient °C</div></div>
-        <div class="overview-data"><div class="overview-data-value" id="selected-node-humidity">--</div><div class="overview-data-label">DHT22 humidity</div></div>
-        <div class="overview-data"><div class="overview-data-value" id="selected-node-hotspot">--</div><div class="overview-data-label">MLX90640 hotspot °C</div></div>
-        <div class="overview-data"><div class="overview-data-value" id="selected-node-blocked">--</div><div class="overview-data-label">Reported blockage</div></div>
-      </div>
-      <div class="floor-switcher" role="group" aria-label="Select node camera view">
-        <button type="button" class="media-switch active" data-media="thermal" onclick="selectNodeMedia('thermal', this)">Thermal array</button>
-        <button type="button" class="media-switch" data-media="camera" onclick="selectNodeMedia('camera', this)">ESP32-CAM</button>
-      </div>
-      <div class="overview-media">
-        <img id="selected-thermal-feed" alt="Selected node MLX90640 thermal view" style="display:none">
-        <img id="selected-camera-feed" alt="Selected node ESP32-CAM view" style="display:none">
-        <div class="overview-media-placeholder" id="selected-media-placeholder">Waiting for thermal data…</div>
-      </div>
-      <div class="overview-controls">
-        <label for="selected-audio-track">Audio command</label>
-        <select id="selected-audio-track">
-          {% for track, label in sound_tracks.items() %}
-          <option value="{{ track }}">{{ label }}</option>
-          {% endfor %}
-        </select>
-        <button type="button" class="btn btn-clear btn-sm" onclick="playSelectedSound()">Play on selected node</button>
-      </div>
-    </section>
+    </div>
   </div>
 
   <!-- TAB: NODES -->
@@ -3292,6 +3351,80 @@ HTML_TEMPLATE = """
   function playSelectedSound() {
     const track = Number(document.getElementById('selected-audio-track').value);
     playSound(selectedNodeId, track);
+  }
+
+  // ── LAYOUT SWITCHING ───────────────────────
+  function setOverviewLayout(layout, button) {
+    const container = document.getElementById('overview-container');
+    if (!container) return;
+    container.className = `layout-${layout}`;
+    document.querySelectorAll('.layout-toggle-btn').forEach(btn => {
+      btn.classList.toggle('active', btn === button);
+    });
+    if (layout === 'b') renderNodePreviews();
+  }
+
+  function renderNodePreviews() {
+    const container = document.getElementById('node-previews');
+    if (!container) return;
+    container.innerHTML = '';
+    const otherNodes = MAP_NODE_IDS.filter(id => id !== selectedNodeId);
+    otherNodes.forEach(nodeId => {
+      const node = overviewNodes[nodeId];
+      if (!node) return;
+      const freshness = nodeFreshness(node);
+      const thermalValue = node.thermal != null ? node.thermal.toFixed(1) : '--';
+      const tempValue = node.temperature != null ? node.temperature.toFixed(1) : '--';
+      const humidityValue = node.humidity != null ? node.humidity.toFixed(0) : '--';
+      const isBlocked = freshness === 'online' && node.blocked ? 'Yes' : 'No';
+      const hasCamera = overviewCameras.some(c => c.node_id === nodeId && c.enabled);
+      const hasThermal = node.has_thermal;
+      const card = document.createElement('div');
+      card.className = `node-preview-card ${nodeId === selectedNodeId ? 'selected' : ''}`;
+      card.innerHTML = `
+        <div class="node-preview-name">${node.name}</div>
+        <div class="node-preview-status">${freshness.toUpperCase()}</div>
+        <div class="node-preview-sensors">
+          <div class="node-preview-sensor">
+            <span class="node-preview-sensor-label">Temp:</span>
+            <span class="node-preview-sensor-value ${sensorSeverity(node.temperature, 'ambient')}">${tempValue}°C</span>
+          </div>
+          <div class="node-preview-sensor">
+            <span class="node-preview-sensor-label">Humidity:</span>
+            <span class="node-preview-sensor-value">${humidityValue}%</span>
+          </div>
+          <div class="node-preview-sensor">
+            <span class="node-preview-sensor-label">Blocked:</span>
+            <span class="node-preview-sensor-value">${isBlocked}</span>
+          </div>
+          ${hasThermal ? `
+          <div class="node-preview-sensor">
+            <span class="node-preview-sensor-label">Thermal:</span>
+            <span class="node-preview-sensor-value ${sensorSeverity(node.thermal, 'thermal')}">${thermalValue}°C</span>
+          </div>
+          ` : ''}
+        </div>
+        ${hasCamera || hasThermal ? `
+        <div class="node-preview-media-toggle">
+          ${hasThermal ? `<button type="button" class="node-preview-media-btn active">Thermal</button>` : ''}
+          ${hasCamera ? `<button type="button" class="node-preview-media-btn">Camera</button>` : ''}
+        </div>
+        ` : ''}
+      `;
+      card.addEventListener('click', () => selectNodeFromPreview(nodeId));
+      container.appendChild(card);
+    });
+  }
+
+  function selectNodeFromPreview(nodeId) {
+    if (!MAP_NODE_IDS.includes(nodeId)) return;
+    selectedNodeId = nodeId;
+    document.querySelectorAll('.model-node-pick').forEach(btn => {
+      btn.classList.toggle('selected', btn.dataset.modelNodeId === nodeId);
+    });
+    updateSelectedNodeDisplay();
+    renderBuildingModel();
+    renderNodePreviews();
   }
 
   // ── THERMAL CARDS ──────────────────────────
