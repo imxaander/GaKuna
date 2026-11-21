@@ -933,6 +933,7 @@
   ];
   let buildingNodeHits = [];
   let buildingDrag = null;
+  let buildingFaceLayer = null;
 
   // â”€â”€ TABS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   function switchTab(name, btn) {
@@ -1448,21 +1449,24 @@
     };
   }
 
-  function buildingBoxFaces(box, layout) {
+  function buildingFaceOpacity(floor, floors) {
+    const cutaway = floor === 1 ? buildingView.cutaway1 : buildingView.cutaway2;
+    if (cutaway) return 0.32;
+    return floors.length > 1 && floor === Math.max(...floors) ? 0.32 : 1;
+  }
+
+  function buildingBoxFaces(box, layout, floors) {
     const points = (coords, color, forceKind) => {
       const projected = coords.map(([x, y, z]) => projectBuildingPoint(x, y, z, layout));
       
-      // Calculate depth based on the actual screen projection
-      // We need to find which coordinate contributes most to depth ordering
-      // The camera looks along a direction determined by yaw and elevation
-      // We use a composite depth that accounts for the camera's viewing angle
+      // Calculate depth based on the actual camera projection
+      // Transform to camera space using yaw rotation, then apply elevation
       const depth = coords.reduce((sum, [x, y, z]) => {
-        // Transform to camera space using the same rotation as the projection
+        // Rotate around vertical axis by yaw
         const rotX = x * layout.cosYaw - y * layout.sinYaw;
         const rotY = x * layout.sinYaw + y * layout.cosYaw;
-        // Camera distance = how far along the view direction
-        // The view direction at elevation is: looking forward and down
-        // So depth increases away from camera along the viewing direction
+        // Apply elevation: rotY moves forward/back, z moves up/down
+        // Depth represents distance from camera along view direction
         return sum + rotY * layout.cosElevation + z * layout.sinElevation;
       }, 0) / coords.length;
       const zCoords = coords.map(c => c[2]);
@@ -1476,7 +1480,7 @@
         zMin: Math.min(...zCoords),
         zMax: Math.max(...zCoords),
         stroke: box.colors.stroke,
-        opacity: buildingView.level === 'both' && ((box.floor === 1 && buildingView.cutaway1) || (box.floor === 2 && buildingView.cutaway2)) ? 0.32 : 1
+        opacity: buildingFaceOpacity(box.floor, floors)
       };
     };
     const xSide = layout.sinYaw > 0 ? box.x2 : box.x1;
@@ -1536,6 +1540,22 @@
     });
   }
 
+  function drawBuildingFaces(context, faces, ignoreOpacity) {
+    faces.forEach(face => {
+      context.beginPath();
+      context.moveTo(face.points[0].x, face.points[0].y);
+      face.points.slice(1).forEach(point => context.lineTo(point.x, point.y));
+      context.closePath();
+      context.fillStyle = face.color;
+      context.globalAlpha = ignoreOpacity ? 1 : face.opacity;
+      context.fill();
+      context.strokeStyle = face.stroke;
+      context.lineWidth = 0.65;
+      context.stroke();
+      context.globalAlpha = 1;
+    });
+  }
+
   function renderBuildingModel() {
     renderBuildingNodeList();
     const canvas = document.getElementById('building-model-canvas');
@@ -1561,56 +1581,46 @@
     const boxes = [];
     const labels = [];
     floors.forEach(floor => createBuildingLevel(floor, boxes, labels));
-    const faces = boxes.flatMap(box => buildingBoxFaces(box, layout));
-    
-    // Calculate camera distance for each face based on viewing angle
-    // This ensures proper z-ordering from all viewing angles
-    faces.forEach(face => {
-      // Calculate the centroid of the face in 3D space
-      // For depth sorting, we need to project back to 3D from the 2D coordinates
-      // But we already have the original coordinates, so we use the depth value
-      // which represents the distance from the camera's perspective
-      
-      // Enhanced depth calculation that accounts for viewing angle better
-      // Prioritize based on: overall camera distance, then floor, then slab status, then local z
-      const cameraDistance = face.depth + (face.floor === 2 ? 10 : 0); // Add offset for floor
-      face.sortKey = cameraDistance;
-      face.sortFloor = face.floor;
-      face.sortIsSlab = face.kind === 'slab' ? 0 : 1;
-      face.sortZ = face.z;
-    });
-    
+    const faces = boxes.flatMap(box => buildingBoxFaces(box, layout, floors));
     faces.sort((left, right) => {
-      // Primary sort: Use depth-based camera distance for proper z-ordering from all angles
-      // But still respect floor boundaries to prevent crossing
+      // Primary sort: by depth (distance from camera along view direction)
+      // This ensures proper painter's algorithm: far objects first, close objects last
       if (Math.abs(left.depth - right.depth) > 0.5) {
         return left.depth - right.depth;
       }
       
-      // Within similar depths: prioritize slabs (which are floor surfaces)
-      if (left.sortIsSlab !== right.sortIsSlab) return left.sortIsSlab - right.sortIsSlab;
+      // Within similar depths: prioritize slabs (floor/ceiling surfaces)
+      const leftIsSlab = left.kind === 'slab' ? 0 : 1;
+      const rightIsSlab = right.kind === 'slab' ? 0 : 1;
+      if (leftIsSlab !== rightIsSlab) return leftIsSlab - rightIsSlab;
       
-      // Then sort by z-coordinate for objects at similar depth
+      // Then sort by z-coordinate (vertical position)
       if (Math.abs(left.z - right.z) > 0.01) return left.z - right.z;
       
-      // Finally, stable sort by floor if everything else is equal
+      // Finally, sort by floor as a tiebreaker
       if (left.floor !== right.floor) return left.floor - right.floor;
       
       return 0;
     });
-    faces.forEach(face => {
-      context.beginPath();
-      context.moveTo(face.points[0].x, face.points[0].y);
-      face.points.slice(1).forEach(point => context.lineTo(point.x, point.y));
-      context.closePath();
-      context.fillStyle = face.color;
-      context.globalAlpha = face.opacity;
-      context.fill();
-      context.strokeStyle = face.stroke;
-      context.lineWidth = 0.65;
-      context.stroke();
+    const lowerFaces = faces.filter(face => face.floor === 1);
+    const upperFaces = faces.filter(face => face.floor === 2);
+    drawBuildingFaces(context, lowerFaces, false);
+    if (floors.length > 1 && upperFaces.length) {
+      if (!buildingFaceLayer) buildingFaceLayer = document.createElement('canvas');
+      if (buildingFaceLayer.width !== pixelWidth || buildingFaceLayer.height !== pixelHeight) {
+        buildingFaceLayer.width = pixelWidth;
+        buildingFaceLayer.height = pixelHeight;
+      }
+      const layerContext = buildingFaceLayer.getContext('2d');
+      layerContext.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      layerContext.clearRect(0, 0, bounds.width, bounds.height);
+      drawBuildingFaces(layerContext, upperFaces, true);
+      context.globalAlpha = 0.4;
+      context.drawImage(buildingFaceLayer, 0, 0, bounds.width, bounds.height);
       context.globalAlpha = 1;
-    });
+    } else {
+      drawBuildingFaces(context, upperFaces, false);
+    }
     renderBuildingPath(context, layout, floors);
     labels.forEach(label => drawBuildingLabel(context, label, layout));
 

@@ -2357,6 +2357,7 @@ HTML_TEMPLATE = """
   ];
   let buildingNodeHits = [];
   let buildingDrag = null;
+  let buildingFaceLayer = null;
 
   // ── TABS ───────────────────────────────────
   function switchTab(name, btn) {
@@ -2721,7 +2722,7 @@ HTML_TEMPLATE = """
   }
 
   function addBuildingPrism(boxes, x1, x2, y1, y2, z1, z2, kind) {
-    boxes.push({ x1, x2, y1, y2, z1, z2, colors: buildingPalette(kind) });
+    boxes.push({ x1, x2, y1, y2, z1, z2, kind, colors: buildingPalette(kind) });
   }
 
   function addBuildingArea(boxes, labels, x1, x2, y1, y2, base, kind, label, stairAxis) {
@@ -2868,37 +2869,46 @@ HTML_TEMPLATE = """
     };
   }
 
-  function buildingBoxFaces(box, layout) {
-    const points = (coords, color) => {
+  function buildingFaceOpacity(floor, floors) {
+    if (buildingView.cutaway && floor === 2) return 0.32;
+    return floors.length > 1 && floor === Math.max(...floors) ? 0.32 : 1;
+  }
+
+  function buildingBoxFaces(box, layout, floors) {
+    const points = (coords, color, forceKind) => {
       const projected = coords.map(([x, y, z]) => projectBuildingPoint(x, y, z, layout));
       const depth = coords.reduce((sum, [x, y, z]) =>
         sum + (x * layout.sinYaw + y * layout.cosYaw) * layout.cosElevation +
           z * layout.sinElevation, 0) / coords.length;
+      const zCoords = coords.map(c => c[2]);
       return {
         points: projected,
         color,
         depth,
+        floor: box.floor,
+        kind: forceKind || box.kind,
+        z: (Math.min(...zCoords) + Math.max(...zCoords)) / 2,
         stroke: box.colors.stroke,
-        opacity: buildingView.level === 'both' && buildingView.cutaway && box.floor === 2 ? 0.32 : 1
+        opacity: buildingFaceOpacity(box.floor, floors)
       };
     };
     const xSide = layout.sinYaw > 0 ? box.x2 : box.x1;
     const ySide = layout.cosYaw > 0 ? box.y2 : box.y1;
     const faces = [];
+    faces.push(points([
+      [box.x1, box.y1, box.z2], [box.x2, box.y1, box.z2],
+      [box.x2, box.y2, box.z2], [box.x1, box.y2, box.z2]
+    ], box.colors.top, 'slab'));
     if (box.kind !== 'slab') {
       faces.push(points([
-        [box.x1, box.y1, box.z2], [box.x2, box.y1, box.z2],
-        [box.x2, box.y2, box.z2], [box.x1, box.y2, box.z2]
-      ], box.colors.top));
+        [xSide, box.y1, box.z1], [xSide, box.y2, box.z1],
+        [xSide, box.y2, box.z2], [xSide, box.y1, box.z2]
+      ], box.colors.x));
+      faces.push(points([
+        [box.x1, ySide, box.z1], [box.x2, ySide, box.z1],
+        [box.x2, ySide, box.z2], [box.x1, ySide, box.z2]
+      ], box.colors.y));
     }
-    faces.push(points([
-      [xSide, box.y1, box.z1], [xSide, box.y2, box.z1],
-      [xSide, box.y2, box.z2], [xSide, box.y1, box.z2]
-    ], box.colors.x));
-    faces.push(points([
-      [box.x1, ySide, box.z1], [box.x2, ySide, box.z1],
-      [box.x2, ySide, box.z2], [box.x1, ySide, box.z2]
-    ], box.colors.y));
     return faces;
   }
 
@@ -2936,6 +2946,22 @@ HTML_TEMPLATE = """
     });
   }
 
+  function drawBuildingFaces(context, faces, ignoreOpacity) {
+    faces.forEach(face => {
+      context.beginPath();
+      context.moveTo(face.points[0].x, face.points[0].y);
+      face.points.slice(1).forEach(point => context.lineTo(point.x, point.y));
+      context.closePath();
+      context.fillStyle = face.color;
+      context.globalAlpha = ignoreOpacity ? 1 : face.opacity;
+      context.fill();
+      context.strokeStyle = face.stroke;
+      context.lineWidth = 0.65;
+      context.stroke();
+      context.globalAlpha = 1;
+    });
+  }
+
   function renderBuildingModel() {
     renderBuildingNodeList();
     const canvas = document.getElementById('building-model-canvas');
@@ -2961,21 +2987,34 @@ HTML_TEMPLATE = """
     const boxes = [];
     const labels = [];
     floors.forEach(floor => createBuildingLevel(floor, boxes, labels));
-    const faces = boxes.flatMap(box => buildingBoxFaces(box, layout));
-    faces.sort((left, right) => left.depth - right.depth);
-    faces.forEach(face => {
-      context.beginPath();
-      context.moveTo(face.points[0].x, face.points[0].y);
-      face.points.slice(1).forEach(point => context.lineTo(point.x, point.y));
-      context.closePath();
-      context.fillStyle = face.color;
-      context.globalAlpha = face.opacity;
-      context.fill();
-      context.strokeStyle = face.stroke;
-      context.lineWidth = 0.65;
-      context.stroke();
-      context.globalAlpha = 1;
+    const faces = boxes.flatMap(box => buildingBoxFaces(box, layout, floors));
+    faces.sort((left, right) => {
+      if (left.floor !== right.floor) return left.floor - right.floor;
+      if (Math.abs(left.z - right.z) > 0.01) return left.z - right.z;
+      const leftIsSlab = left.kind === 'slab' ? 0 : 1;
+      const rightIsSlab = right.kind === 'slab' ? 0 : 1;
+      if (leftIsSlab !== rightIsSlab) return leftIsSlab - rightIsSlab;
+      return left.depth - right.depth;
     });
+    const lowerFaces = faces.filter(face => face.floor === 1);
+    const upperFaces = faces.filter(face => face.floor === 2);
+    drawBuildingFaces(context, lowerFaces, false);
+    if (floors.length > 1 && upperFaces.length) {
+      if (!buildingFaceLayer) buildingFaceLayer = document.createElement('canvas');
+      if (buildingFaceLayer.width !== pixelWidth || buildingFaceLayer.height !== pixelHeight) {
+        buildingFaceLayer.width = pixelWidth;
+        buildingFaceLayer.height = pixelHeight;
+      }
+      const layerContext = buildingFaceLayer.getContext('2d');
+      layerContext.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      layerContext.clearRect(0, 0, bounds.width, bounds.height);
+      drawBuildingFaces(layerContext, upperFaces, true);
+      context.globalAlpha = 0.4;
+      context.drawImage(buildingFaceLayer, 0, 0, bounds.width, bounds.height);
+      context.globalAlpha = 1;
+    } else {
+      drawBuildingFaces(context, upperFaces, false);
+    }
     renderBuildingPath(context, layout, floors);
     labels.forEach(label => drawBuildingLabel(context, label, layout));
 
