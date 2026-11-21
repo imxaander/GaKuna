@@ -2858,32 +2858,32 @@ HTML_TEMPLATE = """
       const depth = coords.reduce((sum, [x, y, z]) =>
         sum + (x * layout.sinYaw + y * layout.cosYaw) * layout.cosElevation +
           z * layout.sinElevation, 0) / coords.length;
-      let depthBias = 0;
-      if (box.kind === 'slab') depthBias = -0.01;
       return {
         points: projected,
         color,
-        depth: depth + depthBias,
+        depth,
         stroke: box.colors.stroke,
         opacity: buildingView.level === 'both' && buildingView.cutaway && box.floor === 2 ? 0.32 : 1
       };
     };
     const xSide = layout.sinYaw > 0 ? box.x2 : box.x1;
     const ySide = layout.cosYaw > 0 ? box.y2 : box.y1;
-    return [
-      points([
+    const faces = [];
+    if (box.kind !== 'slab') {
+      faces.push(points([
         [box.x1, box.y1, box.z2], [box.x2, box.y1, box.z2],
         [box.x2, box.y2, box.z2], [box.x1, box.y2, box.z2]
-      ], box.colors.top),
-      points([
-        [xSide, box.y1, box.z1], [xSide, box.y2, box.z1],
-        [xSide, box.y2, box.z2], [xSide, box.y1, box.z2]
-      ], box.colors.x),
-      points([
-        [box.x1, ySide, box.z1], [box.x2, ySide, box.z1],
-        [box.x2, ySide, box.z2], [box.x1, ySide, box.z2]
-      ], box.colors.y)
-    ];
+      ], box.colors.top));
+    }
+    faces.push(points([
+      [xSide, box.y1, box.z1], [xSide, box.y2, box.z1],
+      [xSide, box.y2, box.z2], [xSide, box.y1, box.z2]
+    ], box.colors.x));
+    faces.push(points([
+      [box.x1, ySide, box.z1], [box.x2, ySide, box.z1],
+      [box.x2, ySide, box.z2], [box.x1, ySide, box.z2]
+    ], box.colors.y));
+    return faces;
   }
 
   function drawBuildingLabel(context, label, layout) {
