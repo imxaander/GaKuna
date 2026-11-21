@@ -2858,10 +2858,12 @@ HTML_TEMPLATE = """
       const depth = coords.reduce((sum, [x, y, z]) =>
         sum + (x * layout.sinYaw + y * layout.cosYaw) * layout.cosElevation +
           z * layout.sinElevation, 0) / coords.length;
+      let depthBias = 0;
+      if (box.kind === 'slab') depthBias = -0.01;
       return {
         points: projected,
         color,
-        depth,
+        depth: depth + depthBias,
         stroke: box.colors.stroke,
         opacity: buildingView.level === 'both' && buildingView.cutaway && box.floor === 2 ? 0.32 : 1
       };
